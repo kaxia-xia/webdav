@@ -1,11 +1,11 @@
 #include "file_ops.h"
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 namespace file_ops {
 
 fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
-    // Normalize: remove leading slash
     while (!request_path.empty() && request_path.front() == '/') {
         request_path.remove_prefix(1);
     }
@@ -15,15 +15,11 @@ fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
         resolved /= request_path;
     }
 
-    // Lexically normalize to resolve . and ..
     resolved = resolved.lexically_normal();
 
-    // Check path traversal: resolved path must be under root_dir
-    // Simple approach: convert both to strings and check prefix
     std::string root_str = root_dir.lexically_normal().string();
     std::string resolved_str = resolved.string();
 
-    // Ensure root_str ends with separator for proper prefix matching
     if (!root_str.empty() && root_str.back() != '/') {
         root_str += '/';
     }
@@ -32,9 +28,8 @@ fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
     }
 
     if (!resolved_str.starts_with(root_str)) {
-        return {}; // Path traversal attempt
+        return {};
     }
-
     return resolved;
 }
 
@@ -62,27 +57,33 @@ std::chrono::system_clock::time_point last_modified(const fs::path& p) {
     std::error_code ec;
     auto ftime = fs::last_write_time(p, ec);
     if (ec) return {};
-    // Convert filesystem time to system_clock time
     return std::chrono::file_clock::to_sys(ftime);
 }
 
 std::vector<DirEntry> list_directory(const fs::path& p) {
     std::vector<DirEntry> entries;
     std::error_code ec;
+
     for (const auto& entry : fs::directory_iterator(p, ec)) {
         DirEntry de;
         de.name = entry.path().filename().string();
+
+        // Use the directory_entry's cached type (from readdir d_type on Linux)
+        // to avoid a separate stat syscall for is_directory.
+        // fs::is_directory on a directory_entry uses the cached status.
         de.is_directory = entry.is_directory(ec);
         if (de.is_directory) {
             de.size = 0;
         } else {
             de.size = entry.file_size(ec);
         }
+
         auto ftime = entry.last_write_time(ec);
         de.last_modified = std::chrono::file_clock::to_sys(ftime);
-        de.creation_time = de.last_modified; // fs doesn't reliably give creation time
+        de.creation_time = de.last_modified;
         entries.push_back(std::move(de));
     }
+
     // Sort: directories first, then alphabetical
     std::sort(entries.begin(), entries.end(), [](const DirEntry& a, const DirEntry& b) {
         if (a.is_directory != b.is_directory) return a.is_directory;

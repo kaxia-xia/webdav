@@ -5,7 +5,7 @@
 
 namespace http {
 
-// ---------- Request ----------
+// ── Request ──────────────────────────────────────────────────────────────────
 
 std::optional<std::string_view> Request::header(std::string_view name) const {
     for (const auto& h : headers) {
@@ -29,7 +29,7 @@ std::string Request::depth() const {
     return std::string(*h);
 }
 
-// ---------- Parser ----------
+// ── Parser ───────────────────────────────────────────────────────────────────
 
 Parser::Parser() { reset(); }
 
@@ -48,17 +48,14 @@ bool Parser::parse(std::string_view data) {
     while (state_ != State::COMPLETE) {
         switch (state_) {
         case State::REQUEST_LINE: {
-            // Find \r\n
             auto pos = buffer_.find("\r\n");
             if (pos == std::string::npos) {
-                // Need more data, but protect against too-large first line
                 if (buffer_.size() > 8192) return false;
                 return false;
             }
             std::string line = buffer_.substr(0, pos);
             buffer_.erase(0, pos + 2);
 
-            // Parse: METHOD URI HTTP/VERSION
             auto parts = utils::split(line, ' ');
             if (parts.size() < 3) return false;
 
@@ -67,7 +64,6 @@ bool Parser::parse(std::string_view data) {
             request_.uri = std::string(parts[1]);
             request_.version = std::string(parts[2]);
 
-            // Parse path and query
             auto qpos = request_.uri.find('?');
             if (qpos != std::string::npos) {
                 request_.path = utils::url_decode(request_.uri.substr(0, qpos));
@@ -80,7 +76,6 @@ bool Parser::parse(std::string_view data) {
             break;
         }
         case State::HEADERS: {
-            // Read headers line by line
             auto pos = buffer_.find("\r\n");
             if (pos == std::string::npos) {
                 if (buffer_.size() > 65536) return false;
@@ -90,7 +85,6 @@ bool Parser::parse(std::string_view data) {
             buffer_.erase(0, pos + 2);
 
             if (line.empty()) {
-                // End of headers
                 auto cl = request_.content_length();
                 if (cl.has_value()) {
                     body_expected_ = *cl;
@@ -101,12 +95,10 @@ bool Parser::parse(std::string_view data) {
                         leftover_ = buffer_;
                     }
                 } else {
-                    // No Content-Length for GET/HEAD/etc — no body
                     state_ = State::COMPLETE;
                     leftover_ = buffer_;
                 }
             } else {
-                // Parse header: Name: Value
                 auto colon = line.find(':');
                 if (colon != std::string::npos) {
                     Header h;
@@ -124,7 +116,7 @@ bool Parser::parse(std::string_view data) {
                 state_ = State::COMPLETE;
                 leftover_ = buffer_;
             } else {
-                return false; // Need more data
+                return false;
             }
             break;
         }
@@ -135,7 +127,7 @@ bool Parser::parse(std::string_view data) {
     return true;
 }
 
-// ---------- Response ----------
+// ── Response ─────────────────────────────────────────────────────────────────
 
 void Response::set_header(std::string_view name, std::string_view value) {
     headers.push_back(Header{std::string(name), std::string(value)});
@@ -149,16 +141,37 @@ void Response::set_content_length(size_t len) {
     set_header("Content-Length", std::to_string(len));
 }
 
+std::optional<size_t> Response::content_length_opt() const {
+    for (const auto& h : headers) {
+        if (utils::iequals(h.name, "Content-Length")) {
+            size_t val = 0;
+            auto result = std::from_chars(h.value.data(), h.value.data() + h.value.size(), val);
+            if (result.ec == std::errc{}) return val;
+        }
+    }
+    return std::nullopt;
+}
+
 std::string Response::to_string() const {
     std::string result;
-    result.reserve(256 + body.size());
 
+    // ── Pre-compute exact size to avoid reallocs ──────────────────────────
+    size_t estimate = 20;  // "HTTP/1.1 XXX ...\r\n"
+    for (const auto& h : headers) {
+        estimate += h.name.size() + h.value.size() + 4;  // ": " + "\r\n"
+    }
+    estimate += 2;           // trailing "\r\n"
+    estimate += body.size(); // body (empty when using sendfile)
+    result.reserve(estimate);
+
+    // ── Status line ──────────────────────────────────────────────────────
     result += "HTTP/1.1 ";
     result += std::to_string(status_code);
     result += " ";
     result += status_text.empty() ? std::string(status_message(status_code)) : status_text;
     result += "\r\n";
 
+    // ── Headers ───────────────────────────────────────────────────────────
     for (const auto& h : headers) {
         result += h.name;
         result += ": ";
@@ -171,7 +184,7 @@ std::string Response::to_string() const {
     return result;
 }
 
-// ---------- Helpers ----------
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 Method parse_method(std::string_view s) {
     if (utils::iequals(s, "GET"))       return Method::GET;

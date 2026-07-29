@@ -35,7 +35,7 @@ struct Request {
     Method method = Method::UNKNOWN;
     std::string method_str;
     std::string uri;
-    std::string path;  // decoded path
+    std::string path;   // decoded path
     std::string query;  // query string (after ?)
     std::string version;
     std::vector<Header> headers;
@@ -99,10 +99,18 @@ struct Response {
     std::vector<Header> headers;
     std::string body;
 
+    // If set, the server will send this file via sendfile() after the headers.
+    // body should be empty when this is used.
+    std::optional<std::string> file_to_send;
+
     void set_header(std::string_view name, std::string_view value);
     void set_content_type(std::string_view ct);
     void set_content_length(size_t len);
 
+    // Read back the Content-Length header value (for sendfile logic)
+    std::optional<size_t> content_length_opt() const;
+
+    // Serialize to wire format (headers + body; body is omitted when file_to_send is set)
     std::string to_string() const;
 };
 

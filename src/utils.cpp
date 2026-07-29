@@ -1,8 +1,11 @@
 #include "utils.h"
 #include <algorithm>
 #include <cctype>
+#include <array>
 
 namespace utils {
+
+// ── URL codec ────────────────────────────────────────────────────────────────
 
 std::string url_decode(std::string_view str) {
     std::string result;
@@ -41,19 +44,22 @@ std::string url_encode(std::string_view str) {
             result.push_back(c);
         } else {
             std::ostringstream oss;
-            oss << '%' << std::uppercase << std::hex << static_cast<int>(static_cast<unsigned char>(c));
+            oss << '%' << std::uppercase << std::hex
+                << static_cast<int>(static_cast<unsigned char>(c));
             result += oss.str();
         }
     }
     return result;
 }
 
+// ── Time formatting ──────────────────────────────────────────────────────────
+
 std::string rfc1123_time(const std::chrono::system_clock::time_point& tp) {
     auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm_buf;
     gmtime_r(&t, &tm_buf);
     std::ostringstream oss;
-    const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    const char* days[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun",
                             "Jul","Aug","Sep","Oct","Nov","Dec"};
     oss << days[tm_buf.tm_wday] << ", "
@@ -81,51 +87,81 @@ std::string iso8601_time(const std::chrono::system_clock::time_point& tp) {
     return oss.str();
 }
 
+// ── MIME type (sorted array + binary search → O(log n), no allocations) ─────
+
+namespace {
+    using MimeEntry = std::pair<std::string_view, std::string_view>;
+
+    // MUST stay sorted by extension for binary_search
+    constexpr std::array<MimeEntry, 42> kMimeMap = {{
+        {".avi",   "video/x-msvideo"},
+        {".bz2",   "application/x-bzip2"},
+        {".c",     "text/plain; charset=utf-8"},
+        {".cc",    "text/plain; charset=utf-8"},
+        {".cpp",   "text/plain; charset=utf-8"},
+        {".css",   "text/css; charset=utf-8"},
+        {".csv",   "text/csv; charset=utf-8"},
+        {".cxx",   "text/plain; charset=utf-8"},
+        {".gif",   "image/gif"},
+        {".go",    "text/plain; charset=utf-8"},
+        {".gz",    "application/gzip"},
+        {".h",     "text/plain; charset=utf-8"},
+        {".hh",    "text/plain; charset=utf-8"},
+        {".hpp",   "text/plain; charset=utf-8"},
+        {".htm",   "text/html; charset=utf-8"},
+        {".html",  "text/html; charset=utf-8"},
+        {".hxx",   "text/plain; charset=utf-8"},
+        {".ico",   "image/x-icon"},
+        {".java",  "text/plain; charset=utf-8"},
+        {".jpeg",  "image/jpeg"},
+        {".jpg",   "image/jpeg"},
+        {".js",    "application/javascript; charset=utf-8"},
+        {".json",  "application/json; charset=utf-8"},
+        {".md",    "text/markdown; charset=utf-8"},
+        {".mp3",   "audio/mpeg"},
+        {".mp4",   "video/mp4"},
+        {".pdf",   "application/pdf"},
+        {".png",   "image/png"},
+        {".py",    "text/plain; charset=utf-8"},
+        {".rs",    "text/plain; charset=utf-8"},
+        {".sh",    "text/plain; charset=utf-8"},
+        {".svg",   "image/svg+xml"},
+        {".tar",   "application/x-tar"},
+        {".toml",  "text/plain; charset=utf-8"},
+        {".txt",   "text/plain; charset=utf-8"},
+        {".webm",  "video/webm"},
+        {".webp",  "image/webp"},
+        {".xml",   "application/xml; charset=utf-8"},
+        {".xz",    "application/x-xz"},
+        {".yaml",  "text/plain; charset=utf-8"},
+        {".yml",   "text/plain; charset=utf-8"},
+        {".zip",   "application/zip"},
+    }};
+} // anonymous namespace
+
 std::string mime_type(std::string_view path) {
-    // Extract extension
     auto dot = path.rfind('.');
     if (dot == std::string_view::npos) return "application/octet-stream";
-    std::string ext(path.substr(dot));
-    // Lowercase
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
 
-    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
-    if (ext == ".css")  return "text/css; charset=utf-8";
-    if (ext == ".js")   return "application/javascript; charset=utf-8";
-    if (ext == ".json") return "application/json; charset=utf-8";
-    if (ext == ".xml")  return "application/xml; charset=utf-8";
-    if (ext == ".txt")  return "text/plain; charset=utf-8";
-    if (ext == ".md")   return "text/markdown; charset=utf-8";
-    if (ext == ".csv")  return "text/csv; charset=utf-8";
-    if (ext == ".pdf")  return "application/pdf";
-    if (ext == ".png")  return "image/png";
-    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
-    if (ext == ".gif")  return "image/gif";
-    if (ext == ".svg")  return "image/svg+xml";
-    if (ext == ".webp") return "image/webp";
-    if (ext == ".ico")  return "image/x-icon";
-    if (ext == ".mp3")  return "audio/mpeg";
-    if (ext == ".mp4")  return "video/mp4";
-    if (ext == ".webm") return "video/webm";
-    if (ext == ".zip")  return "application/zip";
-    if (ext == ".tar")  return "application/x-tar";
-    if (ext == ".gz")   return "application/gzip";
-    if (ext == ".bz2")  return "application/x-bzip2";
-    if (ext == ".xz")   return "application/x-xz";
-    if (ext == ".c" || ext == ".h")   return "text/plain; charset=utf-8";
-    if (ext == ".cpp" || ext == ".hpp" || ext == ".cc" || ext == ".hh" || ext == ".cxx" || ext == ".hxx")
-        return "text/plain; charset=utf-8";
-    if (ext == ".py")   return "text/plain; charset=utf-8";
-    if (ext == ".rs")   return "text/plain; charset=utf-8";
-    if (ext == ".go")   return "text/plain; charset=utf-8";
-    if (ext == ".java") return "text/plain; charset=utf-8";
-    if (ext == ".sh")   return "text/plain; charset=utf-8";
-    if (ext == ".yaml" || ext == ".yml") return "text/plain; charset=utf-8";
-    if (ext == ".toml") return "text/plain; charset=utf-8";
+    // Build lowercased extension
+    std::string_view ext_sv = path.substr(dot);
+    std::string ext;
+    ext.reserve(ext_sv.size());
+    for (char c : ext_sv) {
+        ext.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
 
+    // Binary search in sorted array
+    auto it = std::lower_bound(kMimeMap.begin(), kMimeMap.end(), ext,
+        [](const MimeEntry& e, const std::string& key) { return e.first < key; });
+
+    if (it != kMimeMap.end() && it->first == ext) {
+        return std::string(it->second);
+    }
     return "application/octet-stream";
 }
+
+// ── String utilities ─────────────────────────────────────────────────────────
 
 std::string_view trim(std::string_view s) {
     auto start = s.find_first_not_of(" \t\r\n");

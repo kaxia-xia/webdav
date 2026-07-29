@@ -6,6 +6,46 @@
 
 namespace html_dir {
 
+// ── Cached CSS (computed once, reused for all requests) ──────────────────────
+static const std::string& cached_css() {
+    static const std::string css = [] {
+        std::ostringstream s;
+        s << "  * { box-sizing: border-box; margin: 0; padding: 0; }\r\n";
+        s << "  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; "
+             "background: #f5f5f5; color: #333; }\r\n";
+        s << "  .header { background: #2c3e50; color: white; padding: 16px 24px; }\r\n";
+        s << "  .header h1 { font-size: 1.3em; font-weight: 500; }\r\n";
+        s << "  .header .server { font-size: 0.85em; opacity: 0.7; margin-top: 4px; }\r\n";
+        s << "  .container { max-width: 960px; margin: 24px auto; padding: 0 16px; }\r\n";
+        s << "  .breadcrumb { background: white; padding: 12px 20px; border-radius: 8px; "
+             "margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-size: 0.9em; }\r\n";
+        s << "  .breadcrumb a { color: #3498db; text-decoration: none; }\r\n";
+        s << "  .breadcrumb a:hover { text-decoration: underline; }\r\n";
+        s << "  .breadcrumb span { color: #999; margin: 0 6px; }\r\n";
+        s << "  table { width: 100%; background: white; border-radius: 8px; "
+             "box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-collapse: collapse; }\r\n";
+        s << "  th { text-align: left; padding: 12px 20px; font-size: 0.8em; text-transform: uppercase; "
+             "color: #888; border-bottom: 2px solid #eee; letter-spacing: 0.5px; }\r\n";
+        s << "  td { padding: 10px 20px; border-bottom: 1px solid #f0f0f0; }\r\n";
+        s << "  tr:hover { background: #f8f9fa; }\r\n";
+        s << "  .icon { width: 24px; text-align: center; padding-right: 8px; }\r\n";
+        s << "  .name a { color: #2c3e50; text-decoration: none; }\r\n";
+        s << "  .name a:hover { color: #3498db; text-decoration: underline; }\r\n";
+        s << "  .dir a { font-weight: 500; color: #2980b9; }\r\n";
+        s << "  .size { color: #888; text-align: right; white-space: nowrap; }\r\n";
+        s << "  .date { color: #888; text-align: right; white-space: nowrap; font-size: 0.9em; }\r\n";
+        s << "  .footer { text-align: center; padding: 24px; color: #aaa; font-size: 0.85em; }\r\n";
+        s << "  @media (max-width: 600px) {\r\n";
+        s << "    .date { display: none; }\r\n";
+        s << "    td { padding: 8px 12px; }\r\n";
+        s << "  }\r\n";
+        return s.str();
+    }();
+    return css;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
 static std::string escape_html(std::string_view s) {
     std::string result;
     result.reserve(s.size());
@@ -38,10 +78,12 @@ static std::string format_size(uintmax_t size) {
     return oss.str();
 }
 
+// ── Main generator ───────────────────────────────────────────────────────────
+
 std::string generate(std::string_view path, const fs::path& resolved_path) {
     auto entries = file_ops::list_directory(resolved_path);
 
-    // Compute parent path
+    // Parent path
     std::string parent_path;
     if (path != "/") {
         auto last_slash = path.rfind('/');
@@ -52,7 +94,6 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
         }
     }
 
-    // Ensure path ends with /
     std::string display_path(path);
     if (display_path.empty() || display_path.back() != '/') {
         display_path += '/';
@@ -66,35 +107,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     html << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\r\n";
     html << "<title>Index of " << escape_html(display_path) << "</title>\r\n";
     html << "<style>\r\n";
-    html << "  * { box-sizing: border-box; margin: 0; padding: 0; }\r\n";
-    html << "  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; "
-            "background: #f5f5f5; color: #333; }\r\n";
-    html << "  .header { background: #2c3e50; color: white; padding: 16px 24px; }\r\n";
-    html << "  .header h1 { font-size: 1.3em; font-weight: 500; }\r\n";
-    html << "  .header .server { font-size: 0.85em; opacity: 0.7; margin-top: 4px; }\r\n";
-    html << "  .container { max-width: 960px; margin: 24px auto; padding: 0 16px; }\r\n";
-    html << "  .breadcrumb { background: white; padding: 12px 20px; border-radius: 8px; "
-            "margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-size: 0.9em; }\r\n";
-    html << "  .breadcrumb a { color: #3498db; text-decoration: none; }\r\n";
-    html << "  .breadcrumb a:hover { text-decoration: underline; }\r\n";
-    html << "  .breadcrumb span { color: #999; margin: 0 6px; }\r\n";
-    html << "  table { width: 100%; background: white; border-radius: 8px; "
-            "box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-collapse: collapse; }\r\n";
-    html << "  th { text-align: left; padding: 12px 20px; font-size: 0.8em; text-transform: uppercase; "
-            "color: #888; border-bottom: 2px solid #eee; letter-spacing: 0.5px; }\r\n";
-    html << "  td { padding: 10px 20px; border-bottom: 1px solid #f0f0f0; }\r\n";
-    html << "  tr:hover { background: #f8f9fa; }\r\n";
-    html << "  .icon { width: 24px; text-align: center; padding-right: 8px; }\r\n";
-    html << "  .name a { color: #2c3e50; text-decoration: none; }\r\n";
-    html << "  .name a:hover { color: #3498db; text-decoration: underline; }\r\n";
-    html << "  .dir a { font-weight: 500; color: #2980b9; }\r\n";
-    html << "  .size { color: #888; text-align: right; white-space: nowrap; }\r\n";
-    html << "  .date { color: #888; text-align: right; white-space: nowrap; font-size: 0.9em; }\r\n";
-    html << "  .footer { text-align: center; padding: 24px; color: #aaa; font-size: 0.85em; }\r\n";
-    html << "  @media (max-width: 600px) {\r\n";
-    html << "    .date { display: none; }\r\n";
-    html << "    td { padding: 8px 12px; }\r\n";
-    html << "  }\r\n";
+    html << cached_css();           // ← static, computed once
     html << "</style>\r\n";
     html << "</head>\r\n";
     html << "<body>\r\n";
@@ -102,7 +115,8 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     // Header
     html << "<div class=\"header\">\r\n";
     html << "  <h1>📁 Index of " << escape_html(display_path) << "</h1>\r\n";
-    html << "  <div class=\"server\">WebDAV Server &bull; " << entries.size() << " items</div>\r\n";
+    html << "  <div class=\"server\">WebDAV Server &bull; " << entries.size()
+         << " items</div>\r\n";
     html << "</div>\r\n";
 
     html << "<div class=\"container\">\r\n";
@@ -135,7 +149,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
             "</tr></thead>\r\n";
     html << "<tbody>\r\n";
 
-    // Parent directory link
+    // Parent link
     if (!parent_path.empty() || path == "/") {
         html << "<tr>";
         html << "<td class=\"icon\">📂</td>";
