@@ -197,31 +197,26 @@ std::string mime_type(std::string_view path) {
     auto dot = path.rfind('.');
     if (dot == std::string_view::npos) return "application/octet-stream";
 
-    std::string_view ext = path.substr(dot);
+    std::string_view ext_sv = path.substr(dot);
 
-    // Case-insensitive binary search — no temp allocation
-    auto it = std::lower_bound(kMimeMap.begin(), kMimeMap.end(), ext,
+    // Lowercase into stack buffer (max extension in map is 5 chars: .woff2)
+    char ext_lower[16];
+    size_t n = std::min(ext_sv.size(), sizeof(ext_lower) - 1);
+    for (size_t i = 0; i < n; ++i) {
+        ext_lower[i] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(ext_sv[i])));
+    }
+    ext_lower[n] = '\0';
+    std::string_view ext_key(ext_lower, n);
+
+    // Binary search (exact ASCII, all map entries are lowercase)
+    auto it = std::lower_bound(kMimeMap.begin(), kMimeMap.end(), ext_key,
         [](const MimeEntry& e, std::string_view key) {
-            // Case-insensitive compare: e.first vs key
-            if (e.first.size() != key.size()) return e.first.size() < key.size();
-            for (size_t i = 0; i < e.first.size(); ++i) {
-                char a = static_cast<char>(std::tolower(static_cast<unsigned char>(e.first[i])));
-                char b = static_cast<char>(std::tolower(static_cast<unsigned char>(key[i])));
-                if (a != b) return a < b;
-            }
-            return false;  // equal
+            return e.first < key;
         });
 
-    if (it != kMimeMap.end() && it->first.size() == ext.size()) {
-        bool match = true;
-        for (size_t i = 0; i < ext.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>((*it).first[i])) !=
-                std::tolower(static_cast<unsigned char>(ext[i]))) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return std::string(it->second);
+    if (it != kMimeMap.end() && it->first == ext_key) {
+        return std::string(it->second);
     }
     return "application/octet-stream";
 }
