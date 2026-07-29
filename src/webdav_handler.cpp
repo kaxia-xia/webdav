@@ -162,18 +162,49 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
         return resp;
     }
 
-    // ── Regular file → sendfile (zero-copy) ───────────────────────────────
+    // ── Regular file → sendfile (zero-copy) + Range support ───────────────
     uintmax_t fsize = file_ops::file_size(resolved);
+    auto range = req.parse_range();
 
     http::Response resp;
-    resp.status_code = 200;
     add_common_headers(resp);
     resp.set_header("Last-Modified", utils::rfc1123_time(file_ops::last_modified(resolved)));
     resp.set_content_type(utils::mime_type(resolved.string()));
-    resp.set_content_length(static_cast<size_t>(fsize));
 
-    if (fsize > 0) {
-        resp.file_to_send = resolved.string();
+    if (range && fsize > 0) {
+        // Clamp range to file size
+        size_t range_start = range->start;
+        size_t range_end   = range->end.value_or(static_cast<size_t>(fsize) - 1);
+
+        if (range_start >= fsize) {
+            // Range Not Satisfiable
+            resp.status_code = 416;
+            resp.set_header("Content-Range", "bytes */" + std::to_string(fsize));
+            resp.set_content_length(0);
+            return resp;
+        }
+
+        if (range_end >= fsize) range_end = static_cast<size_t>(fsize) - 1;
+
+        size_t content_len = range_end - range_start + 1;
+
+        resp.status_code = 206;
+        resp.set_header("Content-Range",
+            "bytes " + std::to_string(range_start) + "-" +
+            std::to_string(range_end) + "/" + std::to_string(fsize));
+        resp.set_content_length(content_len);
+
+        if (content_len > 0) {
+            resp.file_to_send = resolved.string();
+            resp.file_offset = static_cast<off_t>(range_start);
+        }
+    } else {
+        // Full file
+        resp.status_code = 200;
+        resp.set_content_length(static_cast<size_t>(fsize));
+        if (fsize > 0) {
+            resp.file_to_send = resolved.string();
+        }
     }
     return resp;
 }

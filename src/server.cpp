@@ -56,7 +56,7 @@ void Server::shutdown() {
 
 // ── sendfile helper ──────────────────────────────────────────────────────────
 
-ssize_t Server::send_file_range(int out_fd, const std::string& path, size_t count) {
+ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offset, size_t count) {
     if (count == 0) return 0;
 
     int file_fd = ::open(path.c_str(), O_RDONLY);
@@ -66,7 +66,6 @@ ssize_t Server::send_file_range(int out_fd, const std::string& path, size_t coun
         return -1;
     }
 
-    off_t offset = 0;
     size_t remaining = count;
     ssize_t total_sent = 0;
 
@@ -163,7 +162,7 @@ void Server::handle_client(int client_fd) {
             if (resp.file_to_send) {
                 auto cl = resp.content_length_opt();
                 size_t file_size = cl.value_or(0);
-                ssize_t fsent = send_file_range(client_fd, *resp.file_to_send, file_size);
+                ssize_t fsent = send_file_range(client_fd, *resp.file_to_send, resp.file_offset, file_size);
                 if (fsent < 0) {
                     goto close_connection;
                 }

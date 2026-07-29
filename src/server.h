@@ -37,5 +37,5 @@ private:
 
     void worker_loop();
     void handle_client(int client_fd);
-    static ssize_t send_file_range(int out_fd, const std::string& path, size_t count);
+    static ssize_t send_file_range(int out_fd, const std::string& path, off_t offset, size_t count);
 };

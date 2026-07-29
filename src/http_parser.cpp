@@ -29,6 +29,50 @@ std::string Request::depth() const {
     return std::string(*h);
 }
 
+std::optional<ByteRange> Request::parse_range() const {
+    auto h = header("Range");
+    if (!h) return std::nullopt;
+
+    std::string_view v = *h;
+    // Must be "bytes="
+    if (v.size() < 6 || !utils::iequals(v.substr(0, 6), "bytes=")) return std::nullopt;
+
+    std::string_view range_val = v.substr(6);
+    // Only handle first range if multiple ("bytes=0-1023,2048-4095")
+    auto comma = range_val.find(',');
+    if (comma != std::string_view::npos) range_val = range_val.substr(0, comma);
+
+    auto dash = range_val.find('-');
+    if (dash == std::string_view::npos) return std::nullopt;
+
+    std::string_view start_str = range_val.substr(0, dash);
+    std::string_view end_str   = range_val.substr(dash + 1);
+
+    ByteRange br;
+
+    if (start_str.empty()) {
+        // Suffix range: "bytes=-500" → last 500 bytes
+        // We can't handle this without knowing file size yet; skip
+        return std::nullopt;
+    } else {
+        auto res = std::from_chars(start_str.data(), start_str.data() + start_str.size(), br.start);
+        if (res.ec != std::errc{}) return std::nullopt;
+    }
+
+    if (!end_str.empty()) {
+        size_t end = 0;
+        auto res = std::from_chars(end_str.data(), end_str.data() + end_str.size(), end);
+        if (res.ec != std::errc{}) return std::nullopt;
+        br.end = end;
+    }
+    // else: br.end == nullopt → from start to EOF
+
+    // Sanity: end must be >= start if specified
+    if (br.end && *br.end < br.start) return std::nullopt;
+
+    return br;
+}
+
 // ── Parser ───────────────────────────────────────────────────────────────────
 
 Parser::Parser() { reset(); }

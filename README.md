@@ -11,7 +11,8 @@ Serve files over the WebDAV protocol and browse directories via any web browser.
 - **Zero external dependencies** — only C++20 standard library and POSIX sockets
 - **Path traversal protection** — requests cannot escape the served root directory
 - **High concurrency** — epoll-based thread pool with `sendfile()` zero-copy for large files
-- **Tiny footprint** — ~170 KB binary on ARM64
+- **Range requests (HTTP 206)** — seekable streaming for video, audio, and partial downloads
+- **Tiny footprint** — ~190 KB binary on ARM64
 
 ## Quick Start
 

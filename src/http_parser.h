@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <cstddef>
 
 namespace http {
 
@@ -31,6 +32,14 @@ struct Header {
     std::string value;
 };
 
+// Parsed Range: bytes=START-END
+// start and end are inclusive. If end is nullopt → from start to EOF.
+// If both nullopt → no range.
+struct ByteRange {
+    size_t start = 0;
+    std::optional<size_t> end;  // inclusive
+};
+
 struct Request {
     Method method = Method::UNKNOWN;
     std::string method_str;
@@ -49,6 +58,9 @@ struct Request {
 
     // Get Depth header value
     std::string depth() const;
+
+    // Parse Range: bytes= header. Returns nullopt if missing or invalid.
+    std::optional<ByteRange> parse_range() const;
 };
 
 // Parser states for streaming parse
@@ -102,6 +114,9 @@ struct Response {
     // If set, the server will send this file via sendfile() after the headers.
     // body should be empty when this is used.
     std::optional<std::string> file_to_send;
+
+    // Optional byte offset into file_to_send (for Range: requests)
+    off_t file_offset = 0;
 
     void set_header(std::string_view name, std::string_view value);
     void set_content_type(std::string_view ct);
