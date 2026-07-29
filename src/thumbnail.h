@@ -9,7 +9,7 @@ namespace fs = std::filesystem;
 namespace thumbnail {
 
 // Initialize: check if ffmpeg is available, create cache directory
-void init(const fs::path& root_dir);
+void init();
 
 // Generate a thumbnail for a media file.
 // Returns the thumbnail image data (JPEG/PNG) or an SVG icon as fallback.

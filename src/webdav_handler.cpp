@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <charconv>
+#include <unistd.h>
 
 WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
                              std::optional<std::string> username,
@@ -547,6 +548,16 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
 
     bool existed = file_ops::exists(resolved);
 
+    // If overwriting an existing file, check it's not in use
+    if (existed && file_ops::is_regular_file(resolved)) {
+        int lock_fd = file_ops::try_lock_exclusive(resolved);
+        if (lock_fd == -1) {
+            // File is currently being streamed — reject
+            return error_response(423, "Locked — file is being read");
+        }
+        if (lock_fd >= 0) ::close(lock_fd);  // release lock, we'll write now
+    }
+
     if (!file_ops::write_file(resolved, req.body)) {
         return error_response(507, "Insufficient Storage");
     }
@@ -562,6 +573,15 @@ http::Response WebDavHandler::handle_delete(const http::Request& req, const fs::
     (void)req;
     if (!file_ops::exists(resolved)) {
         return error_response(404, "Not Found");
+    }
+
+    // For regular files: check if in use before deleting
+    if (file_ops::is_regular_file(resolved)) {
+        int lock_fd = file_ops::try_lock_exclusive(resolved);
+        if (lock_fd == -1) {
+            return error_response(423, "Locked — file is being read");
+        }
+        if (lock_fd >= 0) ::close(lock_fd);
     }
 
     bool ok = file_ops::is_directory(resolved)
@@ -643,11 +663,29 @@ http::Response WebDavHandler::handle_move(const http::Request& req, const fs::pa
         return error_response(404, "Not Found");
     }
 
+    // For regular files: check if source file is in use
+    if (file_ops::is_regular_file(resolved)) {
+        int lock_fd = file_ops::try_lock_exclusive(resolved);
+        if (lock_fd == -1) {
+            return error_response(423, "Locked — file is being read");
+        }
+        if (lock_fd >= 0) ::close(lock_fd);
+    }
+
     auto overwrite = req.header("Overwrite");
     bool allow_overwrite = !overwrite || *overwrite != "F";
 
     if (file_ops::exists(dest_resolved) && !allow_overwrite) {
         return error_response(412, "Precondition Failed");
+    }
+
+    // Also check destination if overwriting
+    if (file_ops::exists(dest_resolved) && file_ops::is_regular_file(dest_resolved)) {
+        int lock_fd = file_ops::try_lock_exclusive(dest_resolved);
+        if (lock_fd == -1) {
+            return error_response(423, "Locked — destination file is being read");
+        }
+        if (lock_fd >= 0) ::close(lock_fd);
     }
 
     auto dest_parent = dest_resolved.parent_path();

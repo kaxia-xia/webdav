@@ -1,6 +1,7 @@
 #include "server.h"
 #include "http_parser.h"
 #include "thumbnail.h"
+#include "file_ops.h"
 #include "utils.h"
 #include <iostream>
 #include <cstring>
@@ -34,7 +35,7 @@ Server::Server(const fs::path& root_dir, int port, bool allow_browser,
     std::cout << "[INFO] Starting with " << num_workers_ << " worker threads" << std::endl;
 
     // Initialize thumbnail subsystem
-    thumbnail::init(root_dir);
+    thumbnail::init();
 }
 
 Server::~Server() {
@@ -68,6 +69,10 @@ ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offse
         std::cerr << "[ERROR] Cannot open file for sendfile: " << path << std::endl;
         return -1;
     }
+
+    // Acquire shared advisory lock — prevents concurrent PUT/DELETE/MOVE
+    // while the file is being streamed. Released automatically on close().
+    file_ops::lock_shared(file_fd);
 
     off_t cur_off = offset;
     size_t remaining = count;

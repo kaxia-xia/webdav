@@ -21,7 +21,7 @@ static fs::path s_cache_dir;
 
 // ── Initialization ───────────────────────────────────────────────────────────
 
-void init(const fs::path& root_dir) {
+void init() {
     // Check if ffmpeg is available
 #ifdef __linux__
     int ret = std::system("ffmpeg -version > /dev/null 2>&1");
@@ -36,12 +36,13 @@ void init(const fs::path& root_dir) {
         std::cout << "[INFO] ffmpeg not found — using media icons for thumbnails" << std::endl;
     }
 
-    // Create cache directory
-    s_cache_dir = root_dir / ".thumbnails";
+    // Create cache directory in system temp (isolated from served files)
+    s_cache_dir = fs::path("/tmp/webdav-thumbnails");
     std::error_code ec;
     if (!fs::exists(s_cache_dir, ec)) {
         fs::create_directory(s_cache_dir, ec);
     }
+    std::cout << "[INFO] Thumbnail cache: " << s_cache_dir << std::endl;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

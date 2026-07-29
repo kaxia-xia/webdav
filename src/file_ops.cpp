@@ -3,6 +3,11 @@
 #include <iostream>
 #include <algorithm>
 
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+
 namespace file_ops {
 
 fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
@@ -154,6 +159,28 @@ DirEntry get_entry(const fs::path& p) {
     de.last_modified = file_ops::last_modified(p);
     de.creation_time = de.last_modified;
     return de;
+}
+
+// ── Advisory file locking ────────────────────────────────────────────────────
+
+int try_lock_exclusive(const fs::path& p) {
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return -2;  // file doesn't exist or can't open
+
+    // LOCK_EX | LOCK_NB: try exclusive lock without blocking
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        ::close(fd);
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            return -1;  // file is in use (shared lock held by reader)
+        }
+        return -2;  // other error
+    }
+    // Lock acquired — caller MUST close(fd) to release
+    return fd;
+}
+
+bool lock_shared(int fd) {
+    return ::flock(fd, LOCK_SH) == 0;
 }
 
 } // namespace file_ops

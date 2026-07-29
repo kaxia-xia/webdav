@@ -66,4 +66,14 @@ bool copy(const fs::path& from, const fs::path& to);
 // Get entry info as DirEntry
 DirEntry get_entry(const fs::path& p);
 
+// ── Advisory file locking ──────────────────────────────────────────────
+// Try to get an exclusive lock on a file (non-blocking).
+// Returns an fd (>=0) if lock acquired — close it to release.
+// Returns -1 if file is in use by readers, -2 on other errors.
+int try_lock_exclusive(const fs::path& p);
+
+// Acquire a shared advisory lock on an already-open fd (blocking).
+// Used during sendfile to prevent concurrent modification/deletion.
+bool lock_shared(int fd);
+
 } // namespace file_ops
