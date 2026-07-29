@@ -40,6 +40,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(webdav-server PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ── Default install prefix ───────────────────────────────────────────────────
+# Use ~/.local when the user doesn't override CMAKE_INSTALL_PREFIX explicitly.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH
+        "Install path prefix (default: ~/.local)" FORCE)
+endif()
+
 # ── Install ──────────────────────────────────────────────────────────────────
 install(TARGETS webdav-server
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
