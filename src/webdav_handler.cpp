@@ -217,8 +217,14 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
 }
 
 http::Response WebDavHandler::handle(const http::Request& req) {
-    // ── Auth check ────────────────────────────────────────────────────────
-    if (!check_auth(req)) {
+    // ── OPTIONS: allow without auth for WebDAV client discovery ───────────
+    // Many WebDAV clients (Windows, macOS Finder, davfs2) send an initial
+    // OPTIONS request without credentials to discover server capabilities.
+    // Requiring auth for OPTIONS breaks interoperability with these clients.
+    bool is_options = (req.method == http::Method::OPTIONS);
+
+    // ── Auth check (skip for OPTIONS) ────────────────────────────────────
+    if (!is_options && !check_auth(req)) {
         http::Response resp;
         resp.status_code = 401;
         resp.status_text = "Unauthorized";
@@ -285,12 +291,14 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     }
 
     // ── Browser requesting a media file → serve player page ───────────────
-    // When auth is enabled, the browser's media element may not include
-    // the Authorization header. By serving an HTML player page, the media
-    // is loaded in the authenticated page context, ensuring credentials
-    // are included in the media request.
-    // Only trigger for actual browsers (Accept: text/html + browser User-Agent)
-    if (allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
+    // Only active when auth is NOT configured. When auth is enabled, we
+    // serve the file directly so the browser uses its native player, which
+    // properly caches and re-sends HTTP Basic auth credentials for all
+    // same-origin requests (including Range requests for seeking).
+    // The player-page approach is incompatible with HTTP Basic auth because
+    // <video>/<audio> elements do NOT include the Authorization header in
+    // their subresource requests.
+    if (!username_ && allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
         // Check if this is a raw media request (from the player page itself)
         if (req.query.find("raw=1") == std::string::npos) {
             return serve_media_player_page(req, resolved);
