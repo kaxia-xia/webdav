@@ -31,7 +31,6 @@ bool WebDavHandler::check_auth(const http::Request& req) {
     if (!auth_hdr) return false;
 
     std::string_view auth = *auth_hdr;
-    // Must start with "Basic "
     if (auth.size() < 6 || !utils::iequals(auth.substr(0, 6), "Basic ")) return false;
 
     std::string decoded = utils::base64_decode(auth.substr(6));
