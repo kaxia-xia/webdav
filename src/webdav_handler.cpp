@@ -289,7 +289,8 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     // the Authorization header. By serving an HTML player page, the media
     // is loaded in the authenticated page context, ensuring credentials
     // are included in the media request.
-    if (allow_browser_ && prefers_html(req) && is_media_file(resolved)) {
+    // Only trigger for actual browsers (Accept: text/html + browser User-Agent)
+    if (allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
         // Check if this is a raw media request (from the player page itself)
         if (req.query.find("raw=1") == std::string::npos) {
             return serve_media_player_page(req, resolved);

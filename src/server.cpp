@@ -109,29 +109,32 @@ void Server::handle_client(int client_fd) {
     bool keep_alive = true;
 
     while (running_ && keep_alive) {
-        ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // Timeout — keep-alive idle, close gracefully
-                break;
+        // ── Read data ────────────────────────────────────────────────────
+        if (pending.empty()) {
+            ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    break; // Timeout — keep-alive idle, close gracefully
+                }
+                break; // connection closed or error
             }
-            break; // connection closed or error
-        }
-
-        std::string_view data(buf, static_cast<size_t>(n));
-        std::string full_data;
-        if (!pending.empty()) {
-            full_data = std::move(pending);
-            full_data.append(data);
-            data = full_data;
+            pending.assign(buf, static_cast<size_t>(n));
         }
 
         // Parse and handle all complete requests in the buffer
-        while (!data.empty() && running_) {
-            if (!parser.parse(data)) {
+        while (!pending.empty() && running_) {
+            if (!parser.parse(pending)) {
                 if (parser.needs_more()) {
-                    pending = std::string(data);
-                    break;
+                    // Read more data into pending
+                    ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
+                    if (n <= 0) {
+                        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            goto close_connection; // incomplete request + timeout
+                        }
+                        goto close_connection;
+                    }
+                    pending.append(buf, static_cast<size_t>(n));
+                    continue; // retry parsing with more data
                 }
                 // Parse error — send 400 and close
                 http::Response resp;
@@ -147,7 +150,7 @@ void Server::handle_client(int client_fd) {
             const auto& req = parser.request();
             http::Response resp = handler_.handle(req);
 
-            // Check Connection header — replace, don't append
+            // Check Connection header
             keep_alive = true;
             auto conn = req.header("Connection");
             if (conn && utils::iequals(*conn, "close")) {
@@ -157,7 +160,7 @@ void Server::handle_client(int client_fd) {
                 resp.set_header("Connection", "keep-alive");
             }
 
-            // Build and send response headers (body is empty for file responses)
+            // Build and send response headers + body (if any, in-memory)
             std::string resp_str = resp.to_string();
             ssize_t sent = ::send(client_fd, resp_str.data(), resp_str.size(), MSG_NOSIGNAL);
             if (sent < 0) {
@@ -174,17 +177,16 @@ void Server::handle_client(int client_fd) {
                 }
             }
 
-            // Get leftover data after this request
-            data = parser.leftover();
+            // Capture leftover (unparsed pipelined data) before resetting parser
+            // leftover() returns a string_view into parser's internal buffer,
+            // so we must copy it before reset() invalidates it.
+            std::string leftover(parser.leftover());
             parser.reset();
+            pending = std::move(leftover);
 
             if (!keep_alive) {
                 goto close_connection;
             }
-        }
-
-        if (data.empty()) {
-            pending.clear();
         }
     }
 
