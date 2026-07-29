@@ -477,7 +477,13 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     // in the video/audio source URL so the browser's media element can
     // access the file without sending HTTP Basic auth credentials (which
     // <video>/<audio> elements don't reliably include in subresource requests).
-    if (allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
+    // Without auth, skip the player page — serve the file directly so the
+    // browser can start playing immediately (one round-trip instead of two).
+    bool needs_player_page = (username_ && password_)   // auth requires token
+                          && is_browser_request(req)
+                          && prefers_html(req)
+                          && is_media_file(resolved);
+    if (needs_player_page) {
         // Check if this is a raw media request (from the player page itself)
         bool has_mtoken = req.query.find("mtoken=") != std::string::npos;
         if (!has_mtoken) {

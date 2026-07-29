@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 
 // ── Constants ────────────────────────────────────────────────────────────────
 static constexpr int MAX_EPOLL_EVENTS = 256;
@@ -74,16 +75,31 @@ ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offse
     // while the file is being streamed. Released automatically on close().
     file_ops::lock_shared(file_fd);
 
+    // Tune send buffer for large media files (256 KB)
+    int sndbuf = 256 * 1024;
+    setsockopt(out_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
     off_t cur_off = offset;
     size_t remaining = count;
     ssize_t total_sent = 0;
+
+    struct pollfd pfd;
+    pfd.fd = out_fd;
+    pfd.events = POLLOUT;
 
     while (remaining > 0) {
         ssize_t n = ::sendfile(out_fd, file_fd, &cur_off, remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);
+                // Wait until socket is writable (100ms timeout)
+                int pr = ::poll(&pfd, 1, 100);
+                if (pr < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(file_fd);
+                    return -1;
+                }
+                if (pr == 0) continue; // timeout, retry sendfile
                 continue;
             }
             ::close(file_fd);
@@ -171,6 +187,14 @@ void Server::handle_client(int client_fd) {
 
             // Build and send response headers + body (if any, in-memory)
             std::string resp_str = resp.to_string();
+
+            // If there's a file to send, use TCP_CORK to combine headers
+            // and file data into fewer TCP segments (less overhead).
+            if (resp.file_to_send) {
+                int cork = 1;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+            }
+
             ssize_t sent = ::send(client_fd, resp_str.data(), resp_str.size(), MSG_NOSIGNAL);
             if (sent < 0) {
                 goto close_connection;
@@ -181,6 +205,11 @@ void Server::handle_client(int client_fd) {
                 auto cl = resp.content_length_opt();
                 size_t file_size = cl.value_or(0);
                 ssize_t fsent = send_file_range(client_fd, *resp.file_to_send, resp.file_offset, file_size);
+
+                // Disable TCP_CORK — flush any remaining data
+                int cork = 0;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
                 if (fsent < 0) {
                     goto close_connection;
                 }
