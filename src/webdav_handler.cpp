@@ -6,14 +6,42 @@
 #include <iostream>
 #include <algorithm>
 
-WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser)
+WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
+                             std::optional<std::string> username,
+                             std::optional<std::string> password)
     : root_dir_(fs::absolute(root_dir).lexically_normal())
     , allow_browser_(allow_browser)
+    , username_(std::move(username))
+    , password_(std::move(password))
 {
     if (!file_ops::exists(root_dir_)) {
         file_ops::create_directory(root_dir_);
     }
     std::cout << "[INFO] Serving directory: " << root_dir_ << std::endl;
+    if (username_ && password_) {
+        std::cout << "[INFO] Authentication enabled (user: " << *username_ << ")" << std::endl;
+    }
+}
+
+bool WebDavHandler::check_auth(const http::Request& req) {
+    // No credentials configured → skip auth
+    if (!username_ || !password_) return true;
+
+    auto auth_hdr = req.header("Authorization");
+    if (!auth_hdr) return false;
+
+    std::string_view auth = *auth_hdr;
+    // Must start with "Basic "
+    if (auth.size() < 6 || !utils::iequals(auth.substr(0, 6), "Basic ")) return false;
+
+    std::string decoded = utils::base64_decode(auth.substr(6));
+    auto colon = decoded.find(':');
+    if (colon == std::string::npos) return false;
+
+    std::string user = decoded.substr(0, colon);
+    std::string pass = decoded.substr(colon + 1);
+
+    return user == *username_ && pass == *password_;
 }
 
 void WebDavHandler::add_common_headers(http::Response& resp) {
@@ -68,6 +96,20 @@ bool WebDavHandler::is_browser_request(const http::Request& req) {
 }
 
 http::Response WebDavHandler::handle(const http::Request& req) {
+    // ── Auth check ────────────────────────────────────────────────────────
+    if (!check_auth(req)) {
+        http::Response resp;
+        resp.status_code = 401;
+        resp.status_text = "Unauthorized";
+        add_common_headers(resp);
+        resp.set_header("WWW-Authenticate", "Basic realm=\"WebDAV\"");
+        resp.set_content_type("text/html; charset=utf-8");
+        std::string body = "<!DOCTYPE html><html><body><h1>401 Unauthorized</h1></body></html>";
+        resp.set_content_length(body.size());
+        resp.body = std::move(body);
+        return resp;
+    }
+
     fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
     if (resolved.empty()) {
         return error_response(403, "Forbidden");
@@ -132,17 +174,15 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     resp.set_content_length(static_cast<size_t>(fsize));
 
     if (fsize > 0) {
-        // Use sendfile for non-empty files — body stays empty
         resp.file_to_send = resolved.string();
     }
     return resp;
 }
 
 http::Response WebDavHandler::handle_head(const http::Request& req, const fs::path& resolved) {
-    // Same as GET but without body / file content
     http::Response resp = handle_get(req, resolved);
     resp.body.clear();
-    resp.file_to_send.reset();  // HEAD must not send file content
+    resp.file_to_send.reset();
     return resp;
 }
 
@@ -212,7 +252,7 @@ http::Response WebDavHandler::handle_propfind(const http::Request& req, const fs
     int depth = 0;
     std::string depth_str = req.depth();
     if (depth_str == "1") depth = 1;
-    else if (depth_str == "infinity") depth = 1;  // cap for safety
+    else if (depth_str == "infinity") depth = 1;
 
     std::string xml = xml_utils::propfind_response("/", root_dir_, resolved, depth);
 

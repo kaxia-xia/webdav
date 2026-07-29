@@ -22,9 +22,11 @@ static constexpr int SOCKET_TIMEOUT_SEC = 30;
 
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
-Server::Server(const fs::path& root_dir, int port, bool allow_browser)
+Server::Server(const fs::path& root_dir, int port, bool allow_browser,
+              std::optional<std::string> username,
+              std::optional<std::string> password)
     : port_(port)
-    , handler_(root_dir, allow_browser)
+    , handler_(root_dir, allow_browser, std::move(username), std::move(password))
     , num_workers_(std::thread::hardware_concurrency())
 {
     if (num_workers_ < 1) num_workers_ = 4;

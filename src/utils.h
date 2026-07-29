@@ -16,6 +16,9 @@ std::string url_decode(std::string_view str);
 // URL-encode a string (path-safe)
 std::string url_encode(std::string_view str);
 
+// Base64-decode a string (used for HTTP Basic auth)
+std::string base64_decode(std::string_view str);
+
 // Format time as RFC 1123 (HTTP-date)
 std::string rfc1123_time(const std::chrono::system_clock::time_point& tp);
 

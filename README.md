@@ -6,20 +6,24 @@ Serve files over the WebDAV protocol and browse directories via any web browser.
 ## Features
 
 - **Full WebDAV support** — GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY, LOCK, UNLOCK, OPTIONS
+- **HTTP Basic Authentication** — optional username/password via command-line flags
 - **Browser-friendly** — auto-detects browser requests and returns a styled HTML directory listing
 - **Zero external dependencies** — only C++20 standard library and POSIX sockets
 - **Path traversal protection** — requests cannot escape the served root directory
-- **Multi-threaded** — handles concurrent clients with `std::jthread`
-- **Tiny footprint** — ~160 KB binary on ARM64
+- **High concurrency** — epoll-based thread pool with `sendfile()` zero-copy for large files
+- **Tiny footprint** — ~170 KB binary on ARM64
 
 ## Quick Start
 
 ```bash
-# Serve the current directory on port 9000
+# Serve the current directory on port 9000 (no authentication)
 webdav-server
 
 # Serve a specific directory
 webdav-server -d /srv/files -p 8080
+
+# With authentication (recommended for public-facing servers)
+webdav-server -u alice -w mypassword
 
 # Access from a browser
 http://localhost:9000/
@@ -37,11 +41,38 @@ sudo mount -t davfs http://localhost:9000 /mnt/webdav
 Usage: webdav-server [OPTIONS]
 
 Options:
-  -d, --dir <path>    Directory to serve (default: current directory)
-  -p, --port <port>   Port to listen on (default: 9000)
-  --no-browser        Disable browser-friendly HTML directory listing
-  -h, --help          Show this help
+  -d, --dir <path>      Directory to serve (default: current directory)
+  -p, --port <port>     Port to listen on (default: 9000)
+  -u, --user <name>     Username for HTTP Basic authentication
+  -w, --pass <password> Password for HTTP Basic authentication
+  --no-browser          Disable browser-friendly HTML directory listing
+  -h, --help            Show this help
+
+Note: --user and --pass must be used together. Both or neither.
 ```
+
+## Authentication
+
+The server supports HTTP Basic Authentication. When `--user` and `--pass` are
+provided, every request must include a valid `Authorization` header. Browsers
+will show a native login dialog automatically.
+
+```bash
+# Start server with auth
+webdav-server -u admin -w secret123
+
+# Access from browser → prompts for username and password
+http://localhost:9000/
+
+# curl with auth
+curl -u admin:secret123 http://localhost:9000/
+
+# WebDAV mount with auth (davfs2)
+sudo mount -t davfs http://localhost:9000 /mnt/webdav -o username=admin,password=secret123
+```
+
+If no `--user` / `--pass` is given, the server runs without authentication
+(open to everyone).
 
 ## Building from Source
 
@@ -89,8 +120,11 @@ cmake --build build -j$(nproc)
 ### curl
 
 ```bash
-# List directory properties
+# Without auth
 curl -X PROPFIND -H "Depth: 1" http://localhost:9000/
+
+# With auth
+curl -u user:pass -X PROPFIND -H "Depth: 1" http://localhost:9000/
 
 # Upload a file
 curl -X PUT -d "Hello World" http://localhost:9000/hello.txt
@@ -126,13 +160,13 @@ webdav-server/
 ├── README.md
 └── src/
     ├── main.cpp                # Entry point + CLI + signals
-    ├── server.h / server.cpp   # TCP server with thread pool
+    ├── server.h / server.cpp   # TCP server with epoll thread pool
     ├── http_parser.h / .cpp    # HTTP request parser & response builder
-    ├── webdav_handler.h / .cpp # WebDAV protocol logic
+    ├── webdav_handler.h / .cpp # WebDAV protocol logic + auth
     ├── file_ops.h / .cpp       # Filesystem operations
     ├── xml_utils.h / .cpp      # PROPFIND XML multi-status responses
     ├── html_dir.h / .cpp       # Browser HTML directory listing
-    └── utils.h / .cpp          # URL codec, MIME types, time formatting
+    └── utils.h / .cpp          # URL codec, MIME types, base64, time formatting
 ```
 
 ## License

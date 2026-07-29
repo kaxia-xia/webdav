@@ -3,12 +3,15 @@
 #include "http_parser.h"
 #include <filesystem>
 #include <string>
+#include <optional>
 
 namespace fs = std::filesystem;
 
 class WebDavHandler {
 public:
-    WebDavHandler(const fs::path& root_dir, bool allow_browser = true);
+    WebDavHandler(const fs::path& root_dir, bool allow_browser = true,
+                  std::optional<std::string> username = std::nullopt,
+                  std::optional<std::string> password = std::nullopt);
 
     // Handle an HTTP request, return the response
     http::Response handle(const http::Request& req);
@@ -19,6 +22,11 @@ public:
 private:
     fs::path root_dir_;
     bool allow_browser_;
+    std::optional<std::string> username_;
+    std::optional<std::string> password_;
+
+    // Check HTTP Basic auth; returns true if authorized (or auth not configured)
+    bool check_auth(const http::Request& req);
 
     // Check if the request is from a browser (Accept: text/html)
     static bool is_browser_request(const http::Request& req);

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 #include <atomic>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -11,7 +12,9 @@ namespace fs = std::filesystem;
 
 class Server {
 public:
-    Server(const fs::path& root_dir, int port = 9000, bool allow_browser = true);
+    Server(const fs::path& root_dir, int port = 9000, bool allow_browser = true,
+          std::optional<std::string> username = std::nullopt,
+          std::optional<std::string> password = std::nullopt);
     ~Server();
 
     // Start the server (blocking — waits for shutdown)
