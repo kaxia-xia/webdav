@@ -62,6 +62,7 @@ std::chrono::system_clock::time_point last_modified(const fs::path& p) {
 
 std::vector<DirEntry> list_directory(const fs::path& p) {
     std::vector<DirEntry> entries;
+    entries.reserve(64);  // avoid reallocs for typical directories
     std::error_code ec;
 
     for (const auto& entry : fs::directory_iterator(p, ec)) {

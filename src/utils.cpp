@@ -43,48 +43,50 @@ std::string url_encode(std::string_view str) {
             c == '.' || c == '~' || c == '/') {
             result.push_back(c);
         } else {
-            std::ostringstream oss;
-            oss << '%' << std::uppercase << std::hex
-                << static_cast<int>(static_cast<unsigned char>(c));
-            result += oss.str();
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%%%02X",
+                     static_cast<unsigned char>(c));
+            result.append(hex, 3);
         }
     }
     return result;
 }
 
-// ── Time formatting ──────────────────────────────────────────────────────────
+// ── Time formatting (stack-based snprintf — zero heap allocation) ────────────
 
 std::string rfc1123_time(const std::chrono::system_clock::time_point& tp) {
     auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm_buf;
     gmtime_r(&t, &tm_buf);
-    std::ostringstream oss;
     const char* days[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun",
                             "Jul","Aug","Sep","Oct","Nov","Dec"};
-    oss << days[tm_buf.tm_wday] << ", "
-        << std::setfill('0') << std::setw(2) << tm_buf.tm_mday << ' '
-        << months[tm_buf.tm_mon] << ' '
-        << (tm_buf.tm_year + 1900) << ' '
-        << std::setw(2) << tm_buf.tm_hour << ':'
-        << std::setw(2) << tm_buf.tm_min << ':'
-        << std::setw(2) << tm_buf.tm_sec << " GMT";
-    return oss.str();
+    char buf[40];
+    // "Wkd, DD Mon YYYY HH:MM:SS GMT" = 29 chars + null
+    int n = snprintf(buf, sizeof(buf), "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                     days[tm_buf.tm_wday],
+                     tm_buf.tm_mday,
+                     months[tm_buf.tm_mon],
+                     tm_buf.tm_year + 1900,
+                     tm_buf.tm_hour,
+                     tm_buf.tm_min,
+                     tm_buf.tm_sec);
+    return std::string(buf, static_cast<size_t>(n));
 }
 
 std::string iso8601_time(const std::chrono::system_clock::time_point& tp) {
     auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm_buf;
     gmtime_r(&t, &tm_buf);
-    std::ostringstream oss;
-    oss << std::setfill('0')
-        << (tm_buf.tm_year + 1900) << '-'
-        << std::setw(2) << (tm_buf.tm_mon + 1) << '-'
-        << std::setw(2) << tm_buf.tm_mday << 'T'
-        << std::setw(2) << tm_buf.tm_hour << ':'
-        << std::setw(2) << tm_buf.tm_min << ':'
-        << std::setw(2) << tm_buf.tm_sec << 'Z';
-    return oss.str();
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                     tm_buf.tm_year + 1900,
+                     tm_buf.tm_mon + 1,
+                     tm_buf.tm_mday,
+                     tm_buf.tm_hour,
+                     tm_buf.tm_min,
+                     tm_buf.tm_sec);
+    return std::string(buf, static_cast<size_t>(n));
 }
 
 // ── Base64 decode (RFC 4648, for HTTP Basic auth) ────────────────────────────
