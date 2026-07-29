@@ -296,8 +296,15 @@ http::Response WebDavHandler::handle(const http::Request& req) {
         return error_response(403, "Forbidden");
     }
 
-    // ── Auth check ────────────────────────────────────────────────────────
-    if (!check_auth(req, resolved)) {
+    // ── OPTIONS: allow without auth for WebDAV client discovery ───────────
+    // Many WebDAV clients (Windows Explorer, macOS Finder, davfs2) send an
+    // initial OPTIONS request WITHOUT credentials to discover server
+    // capabilities. Returning 401 breaks their discovery flow. Apache and
+    // nginx both allow unauthenticated OPTIONS — it's the standard approach.
+    bool is_options = (req.method == http::Method::OPTIONS);
+
+    // ── Auth check (skip for OPTIONS) ────────────────────────────────────
+    if (!is_options && !check_auth(req, resolved)) {
         http::Response resp;
         resp.status_code = 401;
         resp.status_text = "Unauthorized";
