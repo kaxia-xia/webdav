@@ -23,10 +23,25 @@ WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
     }
 }
 
-bool WebDavHandler::check_auth(const http::Request& req) {
+bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolved_path) {
     // No credentials configured → skip auth
     if (!username_ || !password_) return true;
 
+    // ── Media token check (for player page subresource requests) ─────────
+    // Browsers' <video>/<audio> elements don't reliably send HTTP Basic auth
+    // credentials on subresource requests. The player page embeds a temporary
+    // token in the media URL so the file can be accessed without auth.
+    auto token_start = req.query.find("mtoken=");
+    if (token_start != std::string::npos) {
+        std::string token = req.query.substr(token_start + 7); // len("mtoken=")
+        auto amp = token.find('&');
+        if (amp != std::string::npos) token.resize(amp);
+        if (!token.empty() && verify_media_token(resolved_path, token)) {
+            return true;
+        }
+    }
+
+    // ── Standard HTTP Basic auth ─────────────────────────────────────────
     auto auth_hdr = req.header("Authorization");
     if (!auth_hdr) return false;
 
@@ -138,10 +153,18 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
                       resolved.extension() == ".avi" ||
                       resolved.extension() == ".mov");
 
-    // Build the raw media URL (appending ?raw=1 to bypass player page)
-    std::string raw_path = req.path;
-    // URL-encode the path for use in HTML
-    std::string encoded_path = raw_path;
+    // Build the media URL with appropriate query parameter:
+    // - With auth:    include a temporary media token so the browser's <video>
+    //                 element can access the file without sending the
+    //                 Authorization header (which it doesn't reliably do)
+    // - Without auth: simple ?raw=1 to bypass the player page
+    std::string media_query;
+    if (username_ && password_) {
+        std::string token = generate_media_token(resolved);
+        media_query = "?mtoken=" + token;
+    } else {
+        media_query = "?raw=1";
+    }
     // Simple path encoding: replace spaces and special chars
     auto url_encode_path = [](std::string_view p) -> std::string {
         std::string r;
@@ -159,7 +182,7 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
         }
         return r;
     };
-    encoded_path = url_encode_path(raw_path);
+    std::string encoded_path = url_encode_path(req.path);
 
     std::string mime = utils::mime_type(resolved.string());
     uintmax_t fsize = file_ops::file_size(resolved);
@@ -194,12 +217,12 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
 
     if (is_audio) {
         html += "<audio controls autoplay preload=\"auto\">\r\n";
-        html += "<source src=\"" + encoded_path + "?raw=1\" type=\"" + mime + "\">\r\n";
+        html += "<source src=\"" + encoded_path + media_query + "\" type=\"" + mime + "\">\r\n";
         html += "Your browser does not support the audio element.\r\n";
         html += "</audio>\r\n";
     } else {
         html += "<video controls autoplay preload=\"auto\" playsinline>\r\n";
-        html += "<source src=\"" + encoded_path + "?raw=1\" type=\"" + mime + "\">\r\n";
+        html += "<source src=\"" + encoded_path + media_query + "\" type=\"" + mime + "\">\r\n";
         html += "Your browser does not support the video element.\r\n";
         html += "</video>\r\n";
     }
@@ -216,15 +239,65 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
     return resp;
 }
 
-http::Response WebDavHandler::handle(const http::Request& req) {
-    // ── OPTIONS: allow without auth for WebDAV client discovery ───────────
-    // Many WebDAV clients (Windows, macOS Finder, davfs2) send an initial
-    // OPTIONS request without credentials to discover server capabilities.
-    // Requiring auth for OPTIONS breaks interoperability with these clients.
-    bool is_options = (req.method == http::Method::OPTIONS);
+// ── Media token helpers ──────────────────────────────────────────────────────
+// When HTTP Basic auth is enabled, browser <video>/<audio> elements don't
+// reliably include the Authorization header in subresource requests. To
+// work around this, the player page embeds a short-lived token in the
+// media URL. The token is a djb2 hash of (path + expiry + password) and
+// is valid for 1 hour.
 
-    // ── Auth check (skip for OPTIONS) ────────────────────────────────────
-    if (!is_options && !check_auth(req)) {
+static uint64_t djb2_hash(const std::string& data) {
+    uint64_t hash = 5381;
+    for (char c : data) {
+        hash = ((hash << 5) + hash) + static_cast<unsigned char>(c);
+    }
+    return hash;
+}
+
+std::string WebDavHandler::generate_media_token(const fs::path& filepath) const {
+    auto now = std::chrono::system_clock::now();
+    auto expiry = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count() + 3600;  // 1 hour
+
+    std::string key = filepath.string() + "|" + std::to_string(expiry) + "|" + password_.value_or("");
+    return std::to_string(expiry) + "_" + std::to_string(djb2_hash(key));
+}
+
+bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_view token) const {
+    auto underscore = token.find('_');
+    if (underscore == std::string_view::npos) return false;
+
+    auto expiry_sv = token.substr(0, underscore);
+    auto hash_sv   = token.substr(underscore + 1);
+
+    // Parse expiry
+    int64_t expiry = 0;
+    auto res = std::from_chars(expiry_sv.data(), expiry_sv.data() + expiry_sv.size(), expiry);
+    if (res.ec != std::errc{}) return false;
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (now > expiry) return false;
+
+    // Parse expected hash
+    uint64_t expected_hash = 0;
+    res = std::from_chars(hash_sv.data(), hash_sv.data() + hash_sv.size(), expected_hash);
+    if (res.ec != std::errc{}) return false;
+
+    // Recompute hash
+    std::string key = filepath.string() + "|" + std::string(expiry_sv) + "|" + password_.value_or("");
+    return djb2_hash(key) == expected_hash;
+}
+
+http::Response WebDavHandler::handle(const http::Request& req) {
+    // ── Resolve path (needed early for token-based auth) ──────────────────
+    fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
+    if (resolved.empty()) {
+        return error_response(403, "Forbidden");
+    }
+
+    // ── Auth check ────────────────────────────────────────────────────────
+    if (!check_auth(req, resolved)) {
         http::Response resp;
         resp.status_code = 401;
         resp.status_text = "Unauthorized";
@@ -235,11 +308,6 @@ http::Response WebDavHandler::handle(const http::Request& req) {
         resp.set_content_length(body.size());
         resp.body = std::move(body);
         return resp;
-    }
-
-    fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
-    if (resolved.empty()) {
-        return error_response(403, "Forbidden");
     }
 
     switch (req.method) {
@@ -291,19 +359,17 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     }
 
     // ── Browser requesting a media file → serve player page ───────────────
-    // Only active when auth is NOT configured. When auth is enabled, we
-    // serve the file directly so the browser uses its native player, which
-    // properly caches and re-sends HTTP Basic auth credentials for all
-    // same-origin requests (including Range requests for seeking).
-    // The player-page approach is incompatible with HTTP Basic auth because
-    // <video>/<audio> elements do NOT include the Authorization header in
-    // their subresource requests.
-    if (!username_ && allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
+    // When auth is enabled, the player page embeds a temporary media token
+    // in the video/audio source URL so the browser's media element can
+    // access the file without sending HTTP Basic auth credentials (which
+    // <video>/<audio> elements don't reliably include in subresource requests).
+    if (allow_browser_ && is_browser_request(req) && prefers_html(req) && is_media_file(resolved)) {
         // Check if this is a raw media request (from the player page itself)
-        if (req.query.find("raw=1") == std::string::npos) {
+        bool has_mtoken = req.query.find("mtoken=") != std::string::npos;
+        if (!has_mtoken) {
             return serve_media_player_page(req, resolved);
         }
-        // else: query contains "raw=1" → fall through to serve the raw file
+        // else: query contains a media token → fall through to serve raw file
     }
 
     // ── Regular file → sendfile (zero-copy) + Range support ───────────────
