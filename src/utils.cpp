@@ -197,20 +197,31 @@ std::string mime_type(std::string_view path) {
     auto dot = path.rfind('.');
     if (dot == std::string_view::npos) return "application/octet-stream";
 
-    // Build lowercased extension
-    std::string_view ext_sv = path.substr(dot);
-    std::string ext;
-    ext.reserve(ext_sv.size());
-    for (char c : ext_sv) {
-        ext.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    }
+    std::string_view ext = path.substr(dot);
 
-    // Binary search in sorted array
+    // Case-insensitive binary search — no temp allocation
     auto it = std::lower_bound(kMimeMap.begin(), kMimeMap.end(), ext,
-        [](const MimeEntry& e, const std::string& key) { return e.first < key; });
+        [](const MimeEntry& e, std::string_view key) {
+            // Case-insensitive compare: e.first vs key
+            if (e.first.size() != key.size()) return e.first.size() < key.size();
+            for (size_t i = 0; i < e.first.size(); ++i) {
+                char a = static_cast<char>(std::tolower(static_cast<unsigned char>(e.first[i])));
+                char b = static_cast<char>(std::tolower(static_cast<unsigned char>(key[i])));
+                if (a != b) return a < b;
+            }
+            return false;  // equal
+        });
 
-    if (it != kMimeMap.end() && it->first == ext) {
-        return std::string(it->second);
+    if (it != kMimeMap.end() && it->first.size() == ext.size()) {
+        bool match = true;
+        for (size_t i = 0; i < ext.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>((*it).first[i])) !=
+                std::tolower(static_cast<unsigned char>(ext[i]))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return std::string(it->second);
     }
     return "application/octet-stream";
 }

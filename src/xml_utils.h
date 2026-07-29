@@ -15,9 +15,4 @@ std::string propfind_response(
     const fs::path& resolved_path,
     int depth);
 
-// Generate a single <response> element for a file/directory
-std::string file_response_xml(
-    std::string_view href,
-    const file_ops::DirEntry& entry);
-
 } // namespace xml_utils

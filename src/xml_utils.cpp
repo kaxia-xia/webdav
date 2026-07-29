@@ -1,92 +1,104 @@
 #include "xml_utils.h"
 #include "utils.h"
-#include <sstream>
+#include <cstdio>
 
 namespace xml_utils {
 
-static std::string escape_xml(std::string_view s) {
-    std::string result;
-    result.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-        case '&':  result += "&amp;"; break;
-        case '<':  result += "&lt;"; break;
-        case '>':  result += "&gt;"; break;
-        case '"':  result += "&quot;"; break;
-        case '\'': result += "&apos;"; break;
-        default:   result.push_back(c); break;
+// ── XML escape with fast-path (no alloc if no special chars) ─────────────────
+
+// Returns the original data if no escaping needed (to avoid copy).
+// Caller must use correctly — if escaped is empty, use s directly.
+static std::string_view escape_xml_fast(std::string_view s, std::string& buf) {
+    // Fast scan: find first special char
+    size_t i = 0;
+    for (; i < s.size(); ++i) {
+        if (s[i] == '&' || s[i] == '<' || s[i] == '>' ||
+            s[i] == '"' || s[i] == '\'') break;
+    }
+    if (i == s.size()) return s;  // no escaping needed — fast path!
+
+    // Need escaping — build into buf
+    buf.clear();
+    buf.reserve(s.size() + 16);
+    buf.append(s.data(), i);
+    for (; i < s.size(); ++i) {
+        switch (s[i]) {
+        case '&':  buf += "&amp;"; break;
+        case '<':  buf += "&lt;"; break;
+        case '>':  buf += "&gt;"; break;
+        case '"':  buf += "&quot;"; break;
+        case '\'': buf += "&apos;"; break;
+        default:   buf.push_back(s[i]); break;
         }
     }
-    return result;
+    return std::string_view(buf);
 }
 
-std::string file_response_xml(
-    std::string_view href,
-    const file_ops::DirEntry& entry)
+// ── Append a single <D:response> element directly to output buffer ───────────
+
+static void append_file_xml(std::string& out,
+                            std::string_view href,
+                            const file_ops::DirEntry& entry,
+                            std::string& esc_buf)
 {
-    std::ostringstream oss;
-    oss << "    <D:response>\r\n";
-    oss << "      <D:href>" << escape_xml(href) << "</D:href>\r\n";
-    oss << "      <D:propstat>\r\n";
-    oss << "        <D:prop>\r\n";
+    auto href_safe = escape_xml_fast(href, esc_buf);
+    auto name_safe = escape_xml_fast(entry.name, esc_buf);
 
-    // Resource type
+    out += "    <D:response>\r\n";
+    out += "      <D:href>";
+    out += href_safe;
+    out += "</D:href>\r\n";
+    out += "      <D:propstat>\r\n";
+    out += "        <D:prop>\r\n";
+
     if (entry.is_directory) {
-        oss << "          <D:resourcetype><D:collection/></D:resourcetype>\r\n";
+        out += "          <D:resourcetype><D:collection/></D:resourcetype>\r\n";
     } else {
-        oss << "          <D:resourcetype/>\r\n";
+        out += "          <D:resourcetype/>\r\n";
     }
 
-    // Display name
-    oss << "          <D:displayname>" << escape_xml(entry.name) << "</D:displayname>\r\n";
+    out += "          <D:displayname>";
+    out += name_safe;
+    out += "</D:displayname>\r\n";
 
-    // Content length
     if (!entry.is_directory) {
-        oss << "          <D:getcontentlength>" << entry.size << "</D:getcontentlength>\r\n";
+        out += "          <D:getcontentlength>";
+        out += std::to_string(entry.size);
+        out += "</D:getcontentlength>\r\n";
     }
 
-    // Last modified
-    oss << "          <D:getlastmodified>"
-        << utils::rfc1123_time(entry.last_modified)
-        << "</D:getlastmodified>\r\n";
+    out += "          <D:getlastmodified>";
+    out += utils::rfc1123_time(entry.last_modified);
+    out += "</D:getlastmodified>\r\n";
 
-    // Creation date
-    oss << "          <D:creationdate>"
-        << utils::iso8601_time(entry.creation_time)
-        << "</D:creationdate>\r\n";
+    out += "          <D:creationdate>";
+    out += utils::iso8601_time(entry.creation_time);
+    out += "</D:creationdate>\r\n";
 
-    // Content type (rough)
     if (!entry.is_directory) {
-        oss << "          <D:getcontenttype>"
-            << escape_xml(utils::mime_type(entry.name))
-            << "</D:getcontenttype>\r\n";
+        auto mt = utils::mime_type(entry.name);
+        auto mt_safe = escape_xml_fast(mt, esc_buf);
+        out += "          <D:getcontenttype>";
+        out += mt_safe;
+        out += "</D:getcontenttype>\r\n";
+
+        // ETag: size-mtime
+        char etag_buf[64];
+        int n = snprintf(etag_buf, sizeof(etag_buf), "\"%ju-%ld\"",
+                         static_cast<uintmax_t>(entry.size),
+                         static_cast<long>(entry.last_modified.time_since_epoch().count()));
+        out += "          <D:getetag>";
+        out.append(etag_buf, static_cast<size_t>(n));
+        out += "</D:getetag>\r\n";
     }
 
-    // ETag (simple: use size + mtime)
-    if (!entry.is_directory) {
-        oss << "          <D:getetag>\"" << entry.size << "-"
-            << entry.last_modified.time_since_epoch().count()
-            << "\"</D:getetag>\r\n";
-    }
-
-    oss << "        </D:prop>\r\n";
-    oss << "        <D:status>HTTP/1.1 200 OK</D:status>\r\n";
-    oss << "      </D:propstat>\r\n";
-    oss << "    </D:response>\r\n";
-    return oss.str();
+    out += "        </D:prop>\r\n";
+    out += "        <D:status>HTTP/1.1 200 OK</D:status>\r\n";
+    out += "      </D:propstat>\r\n";
+    out += "    </D:response>\r\n";
 }
 
-static std::string not_found_xml(std::string_view href) {
-    std::ostringstream oss;
-    oss << "    <D:response>\r\n";
-    oss << "      <D:href>" << escape_xml(href) << "</D:href>\r\n";
-    oss << "      <D:propstat>\r\n";
-    oss << "        <D:prop/>\r\n";
-    oss << "        <D:status>HTTP/1.1 404 Not Found</D:status>\r\n";
-    oss << "      </D:propstat>\r\n";
-    oss << "    </D:response>\r\n";
-    return oss.str();
-}
+// ── Main PROPFIND response builder ───────────────────────────────────────────
 
 std::string propfind_response(
     std::string_view href_prefix,
@@ -94,57 +106,69 @@ std::string propfind_response(
     const fs::path& resolved_path,
     int depth)
 {
-    // Ensure href_prefix ends with /
+    // ── href prefix ──────────────────────────────────────────────────────
     std::string prefix(href_prefix);
     if (!prefix.empty() && prefix.back() != '/') prefix += '/';
 
-    // Get the relative href path
+    // ── Relative path ────────────────────────────────────────────────────
     std::string rel_path = "/";
+    bool is_dir = file_ops::is_directory(resolved_path);
+
     if (resolved_path != root_dir) {
         auto rel = fs::relative(resolved_path, root_dir).string();
-        // Convert backslashes to forward slashes (Windows)
         std::replace(rel.begin(), rel.end(), '\\', '/');
         if (!rel.empty() && rel != ".") {
             rel_path = prefix + rel;
-            if (!rel_path.empty() && rel_path.back() != '/' &&
-                file_ops::is_directory(resolved_path)) {
+            if (!rel_path.empty() && rel_path.back() != '/' && is_dir) {
                 rel_path += '/';
             }
         }
     }
 
-    std::ostringstream oss;
-    oss << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n";
-    oss << "<D:multistatus xmlns:D=\"DAV:\">\r\n";
+    // ── Estimate output size: header + ~400B per entry ──────────────────
+    std::string out;
+    out.reserve(1024);  // will grow if needed; most dirs < 50 files fit
+    std::string esc_buf;  // reusable temp for escape_xml_fast
+
+    out += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n";
+    out += "<D:multistatus xmlns:D=\"DAV:\">\r\n";
 
     if (file_ops::exists(resolved_path)) {
         auto entry = file_ops::get_entry(resolved_path);
-        oss << file_response_xml(rel_path, entry);
+        append_file_xml(out, rel_path, entry, esc_buf);
 
-        // Depth: 1 — also list children
         if (depth == 1 && entry.is_directory) {
             auto children = file_ops::list_directory(resolved_path);
+
+            // Pre-build href prefix to avoid concat in loop
+            std::string href_base = rel_path;
+            if (href_base != "/" && !href_base.empty() && href_base.back() != '/') {
+                href_base += '/';
+            }
+
             for (const auto& child : children) {
-                std::string child_href = rel_path;
-                if (child_href.empty() || child_href.back() != '/') {
-                    if (child_href == "/") {
-                        child_href += child.name;
-                    } else {
-                        child_href += '/' + child.name;
-                    }
-                } else {
-                    child_href += child.name;
-                }
+                std::string child_href;
+                child_href.reserve(href_base.size() + child.name.size() + 2);
+                child_href = href_base;
+                child_href += child.name;
                 if (child.is_directory) child_href += '/';
-                oss << file_response_xml(child_href, child);
+                append_file_xml(out, child_href, child, esc_buf);
             }
         }
     } else {
-        oss << not_found_xml(rel_path);
+        out += "    <D:response>\r\n";
+        out += "      <D:href>";
+        out += rel_path;
+        out += "</D:href>\r\n";
+        out += "      <D:propstat>\r\n";
+        out += "        <D:prop/>\r\n";
+        out += "        <D:status>HTTP/1.1 404 Not Found</D:status>\r\n";
+        out += "      </D:propstat>\r\n";
+        out += "    </D:response>\r\n";
     }
 
-    oss << "</D:multistatus>\r\n";
-    return oss.str();
+    out += "</D:multistatus>\r\n";
+    return out;
 }
 
 } // namespace xml_utils
