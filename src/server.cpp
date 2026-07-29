@@ -149,12 +149,14 @@ void Server::handle_client(int client_fd) {
             const auto& req = parser.request();
             http::Response resp = handler_.handle(req);
 
-            // Check Connection header
+            // Check Connection header — replace, don't append
             keep_alive = true;
             auto conn = req.header("Connection");
             if (conn && utils::iequals(*conn, "close")) {
                 keep_alive = false;
                 resp.set_header("Connection", "close");
+            } else {
+                resp.set_header("Connection", "keep-alive");
             }
 
             // Build and send response headers (body is empty for file responses)
@@ -242,11 +244,12 @@ void Server::worker_loop() {
                 ssize_t n = ::read(shutdown_fd_, &val, sizeof(val));
                 (void)n;
             } else {
-                // Client fd — handle the request(s)
+                // Client fd — set to blocking mode for handle_client
+                int flags = ::fcntl(fd, F_GETFL, 0);
+                if (flags >= 0) {
+                    ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+                }
                 handle_client(fd);
-
-                // Don't re-arm; handle_client closes the fd
-                // (EPOLLONESHOT already removed it from the interest list)
             }
         }
     }
