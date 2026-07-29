@@ -61,22 +61,28 @@ ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offse
 
     int file_fd = ::open(path.c_str(), O_RDONLY);
     if (file_fd < 0) {
-        std::cerr << "[ERROR] Cannot open file for sendfile: " << path
-                  << " (" << std::strerror(errno) << ")" << std::endl;
+        std::cerr << "[ERROR] Cannot open file for sendfile: " << path << std::endl;
         return -1;
     }
 
+    off_t cur_off = offset;
     size_t remaining = count;
     ssize_t total_sent = 0;
 
     while (remaining > 0) {
-        ssize_t n = ::sendfile(out_fd, file_fd, &offset, remaining);
+        ssize_t n = ::sendfile(out_fd, file_fd, &cur_off, remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            }
+            ::close(file_fd);
+            return -1;
             ::close(file_fd);
             return -1;
         }
-        if (n == 0) break;  // EOF (shouldn't happen if count is correct)
+        if (n == 0) break;
         total_sent += n;
         remaining -= static_cast<size_t>(n);
     }
@@ -95,7 +101,7 @@ void Server::handle_client(int client_fd) {
     tv.tv_sec = SOCKET_TIMEOUT_SEC;
     tv.tv_usec = 0;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // NOTE: Do NOT set SO_SNDTIMEO — it breaks sendfile() for large files
 
     int optval = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
