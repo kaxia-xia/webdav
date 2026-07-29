@@ -40,4 +40,7 @@ bool iequals(std::string_view a, std::string_view b);
 // Get current time in RFC 1123 format
 std::string rfc1123_now();
 
+// Human-readable file size (e.g. "1.5 MB")
+std::string format_size(uintmax_t size);
+
 } // namespace utils

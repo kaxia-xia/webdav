@@ -31,6 +31,15 @@ private:
     // Check if the request is from a browser (Accept: text/html)
     static bool is_browser_request(const http::Request& req);
 
+    // Check if Accept header prefers text/html (page navigation vs media request)
+    static bool prefers_html(const http::Request& req);
+
+    // Check if file is a video or audio file (by extension)
+    static bool is_media_file(const fs::path& path);
+
+    // Serve an HTML5 media player page for video/audio files
+    http::Response serve_media_player_page(const http::Request& req, const fs::path& resolved);
+
     // WebDAV method handlers
     http::Response handle_options(const http::Request& req, const fs::path& resolved);
     http::Response handle_get(const http::Request& req, const fs::path& resolved);

@@ -79,8 +79,6 @@ ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offse
             }
             ::close(file_fd);
             return -1;
-            ::close(file_fd);
-            return -1;
         }
         if (n == 0) break;
         total_sent += n;

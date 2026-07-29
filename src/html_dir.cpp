@@ -62,21 +62,17 @@ static std::string escape_html(std::string_view s) {
     return result;
 }
 
-static std::string format_size(uintmax_t size) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-    int unit_idx = 0;
-    double display = static_cast<double>(size);
-    while (display >= 1024.0 && unit_idx < 4) {
-        display /= 1024.0;
-        ++unit_idx;
-    }
-    char buf[32];
-    if (unit_idx == 0) {
-        snprintf(buf, sizeof(buf), "%d %s", static_cast<int>(display), units[unit_idx]);
-    } else {
-        snprintf(buf, sizeof(buf), "%.1f %s", display, units[unit_idx]);
-    }
-    return std::string(buf);
+// Check if file is a video or audio file (by extension)
+static bool is_media_ext(const std::string& name) {
+    auto dot = name.rfind('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = name.substr(dot);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".mp4"  || ext == ".webm" || ext == ".ogv"  ||
+           ext == ".mkv"  || ext == ".avi"  || ext == ".mov"  ||
+           ext == ".mp3"  || ext == ".ogg"  || ext == ".opus" ||
+           ext == ".flac" || ext == ".wav"  || ext == ".aac"  ||
+           ext == ".m4a"  || ext == ".wma";
 }
 
 // ── Main generator ───────────────────────────────────────────────────────────
@@ -186,7 +182,13 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     for (const auto& entry : entries) {
         h += "<tr>";
         h += "<td class=\"icon\">";
-        h += entry.is_directory ? "📁" : "📄";
+        if (entry.is_directory) {
+            h += "📁";
+        } else if (is_media_ext(entry.name)) {
+            h += "▶️";
+        } else {
+            h += "📄";
+        }
         h += "</td>";
 
         h += "<td class=\"name";
@@ -202,7 +204,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
             h += "<td class=\"size\">—</td>";
         } else {
             h += "<td class=\"size\">";
-            h += format_size(entry.size);
+            h += utils::format_size(entry.size);
             h += "</td>";
         }
 

@@ -94,6 +94,128 @@ bool WebDavHandler::is_browser_request(const http::Request& req) {
     return false;
 }
 
+bool WebDavHandler::prefers_html(const http::Request& req) {
+    auto accept = req.header("Accept");
+    if (!accept) return false;
+    return accept->find("text/html") != std::string_view::npos;
+}
+
+bool WebDavHandler::is_media_file(const fs::path& path) {
+    auto ext = path.extension().string();
+    // Convert to lowercase for comparison
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".mp4"  || ext == ".webm" || ext == ".ogv"  ||
+           ext == ".mkv"  || ext == ".avi"  || ext == ".mov"  ||
+           ext == ".mp3"  || ext == ".ogg"  || ext == ".opus" ||
+           ext == ".flac" || ext == ".wav"  || ext == ".aac"  ||
+           ext == ".m4a"  || ext == ".wma";
+}
+
+http::Response WebDavHandler::serve_media_player_page(const http::Request& req, const fs::path& resolved) {
+    std::string filename = resolved.filename().string();
+    std::string escaped_name = filename;
+    // Basic HTML escaping for the filename
+    auto escape = [](std::string_view s) -> std::string {
+        std::string r;
+        r.reserve(s.size() + 8);
+        for (char c : s) {
+            switch (c) {
+            case '&': r += "&amp;"; break;
+            case '<': r += "&lt;"; break;
+            case '>': r += "&gt;"; break;
+            case '"': r += "&quot;"; break;
+            default:  r.push_back(c); break;
+            }
+        }
+        return r;
+    };
+    escaped_name = escape(escaped_name);
+
+    bool is_audio = !(resolved.extension() == ".mp4" ||
+                      resolved.extension() == ".webm" ||
+                      resolved.extension() == ".ogv" ||
+                      resolved.extension() == ".mkv" ||
+                      resolved.extension() == ".avi" ||
+                      resolved.extension() == ".mov");
+
+    // Build the raw media URL (appending ?raw=1 to bypass player page)
+    std::string raw_path = req.path;
+    // URL-encode the path for use in HTML
+    std::string encoded_path = raw_path;
+    // Simple path encoding: replace spaces and special chars
+    auto url_encode_path = [](std::string_view p) -> std::string {
+        std::string r;
+        r.reserve(p.size() * 3);
+        for (char c : p) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                c == '.' || c == '~' || c == '/') {
+                r.push_back(c);
+            } else {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%%%02X", static_cast<unsigned char>(c));
+                r.append(hex, 3);
+            }
+        }
+        return r;
+    };
+    encoded_path = url_encode_path(raw_path);
+
+    std::string mime = utils::mime_type(resolved.string());
+    uintmax_t fsize = file_ops::file_size(resolved);
+
+    std::string html;
+    html.reserve(2048);
+    html += "<!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n";
+    html += "<meta charset=\"UTF-8\">\r\n";
+    html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\r\n";
+    html += "<title>" + escaped_name + "</title>\r\n";
+    html += "<style>\r\n";
+    html += "*{box-sizing:border-box;margin:0;padding:0;}\r\n";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
+    html += "background:#1a1a2e;color:#eee;display:flex;flex-direction:column;";
+    html += "align-items:center;justify-content:center;min-height:100vh;}\r\n";
+    html += ".player-container{width:100%;max-width:960px;padding:20px;}\r\n";
+    html += ".header{text-align:center;margin-bottom:20px;}\r\n";
+    html += ".header h1{font-size:1.2em;font-weight:400;color:#ccc;word-break:break-all;}\r\n";
+    html += ".header .info{font-size:0.85em;color:#888;margin-top:8px;}\r\n";
+    html += "video,audio{width:100%;border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,0.5);";
+    html += "background:#000;outline:none;}\r\n";
+    html += "audio{min-height:60px;}\r\n";
+    html += ".back-link{display:inline-block;margin-top:20px;color:#888;text-decoration:none;";
+    html += "font-size:0.9em;transition:color 0.2s;}\r\n";
+    html += ".back-link:hover{color:#fff;}\r\n";
+    html += "</style>\r\n</head>\r\n<body>\r\n";
+    html += "<div class=\"player-container\">\r\n";
+    html += "<div class=\"header\">\r\n";
+    html += "<h1>" + escaped_name + "</h1>\r\n";
+    html += "<div class=\"info\">" + utils::format_size(fsize) + " &bull; " + mime + "</div>\r\n";
+    html += "</div>\r\n";
+
+    if (is_audio) {
+        html += "<audio controls autoplay preload=\"auto\">\r\n";
+        html += "<source src=\"" + encoded_path + "?raw=1\" type=\"" + mime + "\">\r\n";
+        html += "Your browser does not support the audio element.\r\n";
+        html += "</audio>\r\n";
+    } else {
+        html += "<video controls autoplay preload=\"auto\" playsinline>\r\n";
+        html += "<source src=\"" + encoded_path + "?raw=1\" type=\"" + mime + "\">\r\n";
+        html += "Your browser does not support the video element.\r\n";
+        html += "</video>\r\n";
+    }
+
+    html += "<a class=\"back-link\" href=\"javascript:history.back()\">&larr; Back to directory</a>\r\n";
+    html += "</div>\r\n</body>\r\n</html>\r\n";
+
+    http::Response resp;
+    resp.status_code = 200;
+    add_common_headers(resp);
+    resp.set_content_type("text/html; charset=utf-8");
+    resp.set_content_length(html.size());
+    resp.body = std::move(html);
+    return resp;
+}
+
 http::Response WebDavHandler::handle(const http::Request& req) {
     // ── Auth check ────────────────────────────────────────────────────────
     if (!check_auth(req)) {
@@ -160,6 +282,19 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
         resp.set_content_length(html.size());
         resp.body = std::move(html);
         return resp;
+    }
+
+    // ── Browser requesting a media file → serve player page ───────────────
+    // When auth is enabled, the browser's media element may not include
+    // the Authorization header. By serving an HTML player page, the media
+    // is loaded in the authenticated page context, ensuring credentials
+    // are included in the media request.
+    if (allow_browser_ && prefers_html(req) && is_media_file(resolved)) {
+        // Check if this is a raw media request (from the player page itself)
+        if (req.query.find("raw=1") == std::string::npos) {
+            return serve_media_player_page(req, resolved);
+        }
+        // else: query contains "raw=1" → fall through to serve the raw file
     }
 
     // ── Regular file → sendfile (zero-copy) + Range support ───────────────

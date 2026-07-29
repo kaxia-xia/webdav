@@ -255,4 +255,21 @@ std::string rfc1123_now() {
     return rfc1123_time(std::chrono::system_clock::now());
 }
 
+std::string format_size(uintmax_t size) {
+    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    int unit_idx = 0;
+    double display = static_cast<double>(size);
+    while (display >= 1024.0 && unit_idx < 4) {
+        display /= 1024.0;
+        ++unit_idx;
+    }
+    char buf[32];
+    if (unit_idx == 0) {
+        snprintf(buf, sizeof(buf), "%d %s", static_cast<int>(display), units[unit_idx]);
+    } else {
+        snprintf(buf, sizeof(buf), "%.1f %s", display, units[unit_idx]);
+    }
+    return std::string(buf);
+}
+
 } // namespace utils
