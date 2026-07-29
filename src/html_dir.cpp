@@ -146,7 +146,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
             accum += '/' + std::string(remaining.substr(pos, slash - pos));
             h += "  <span>/</span>\r\n";
             h += "  <a href=\"";
-            h += escape_html(accum);
+            h += escape_html(utils::url_encode(accum));
             h += "/\">";
             h += escape_html(remaining.substr(pos, slash - pos));
             h += "</a>\r\n";
@@ -167,7 +167,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
         h += "<tr>";
         h += "<td class=\"icon\">📂</td>";
         h += "<td class=\"name dir\"><a href=\"";
-        h += escape_html(parent_path.empty() ? "/" : parent_path);
+        h += escape_html(parent_path.empty() ? "/" : utils::url_encode(parent_path));
         h += "\">..</a></td>";
         h += "<td class=\"size\">—</td>";
         h += "<td class=\"date\">—</td>";
@@ -184,7 +184,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
         h += "<td class=\"name";
         if (entry.is_directory) h += " dir";
         h += "\"><a href=\"";
-        h += escape_html(display_path + utils::url_encode(entry.name));
+        h += escape_html(utils::url_encode(display_path) + utils::url_encode(entry.name));
         h += "\">";
         h += escape_html(entry.name);
         h += "</a></td>";
