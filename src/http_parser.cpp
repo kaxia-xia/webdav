@@ -29,7 +29,7 @@ std::string Request::depth() const {
     return std::string(*h);
 }
 
-std::optional<ByteRange> Request::parse_range() const {
+std::optional<ByteRange> Request::parse_range(std::optional<uintmax_t> file_size) const {
     auto h = header("Range");
     if (!h) return std::nullopt;
 
@@ -52,20 +52,28 @@ std::optional<ByteRange> Request::parse_range() const {
 
     if (start_str.empty()) {
         // Suffix range: "bytes=-500" → last 500 bytes
-        // We can't handle this without knowing file size yet; skip
-        return std::nullopt;
+        if (!file_size || *file_size == 0) return std::nullopt;
+
+        size_t suffix_count = 0;
+        auto res = std::from_chars(end_str.data(), end_str.data() + end_str.size(), suffix_count);
+        if (res.ec != std::errc{}) return std::nullopt;
+        if (suffix_count == 0) return std::nullopt;
+
+        if (suffix_count > *file_size) suffix_count = static_cast<size_t>(*file_size);
+        br.start = static_cast<size_t>(*file_size - suffix_count);
+        br.end   = static_cast<size_t>(*file_size - 1);
     } else {
         auto res = std::from_chars(start_str.data(), start_str.data() + start_str.size(), br.start);
         if (res.ec != std::errc{}) return std::nullopt;
-    }
 
-    if (!end_str.empty()) {
-        size_t end = 0;
-        auto res = std::from_chars(end_str.data(), end_str.data() + end_str.size(), end);
-        if (res.ec != std::errc{}) return std::nullopt;
-        br.end = end;
+        if (!end_str.empty()) {
+            size_t end = 0;
+            auto res2 = std::from_chars(end_str.data(), end_str.data() + end_str.size(), end);
+            if (res2.ec != std::errc{}) return std::nullopt;
+            br.end = end;
+        }
+        // else: br.end == nullopt → from start to EOF
     }
-    // else: br.end == nullopt → from start to EOF
 
     // Sanity: end must be >= start if specified
     if (br.end && *br.end < br.start) return std::nullopt;

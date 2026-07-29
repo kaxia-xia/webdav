@@ -164,7 +164,7 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
 
     // ── Regular file → sendfile (zero-copy) + Range support ───────────────
     uintmax_t fsize = file_ops::file_size(resolved);
-    auto range = req.parse_range();
+    auto range = req.parse_range(fsize);
 
     http::Response resp;
     add_common_headers(resp);

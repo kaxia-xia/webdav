@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <optional>
 #include <cstddef>
+#include <cstdint>
 
 namespace http {
 
@@ -60,7 +61,9 @@ struct Request {
     std::string depth() const;
 
     // Parse Range: bytes= header. Returns nullopt if missing or invalid.
-    std::optional<ByteRange> parse_range() const;
+    // file_size is required to resolve suffix ranges (bytes=-N).
+    // If file_size is nullopt, suffix ranges return nullopt.
+    std::optional<ByteRange> parse_range(std::optional<uintmax_t> file_size = std::nullopt) const;
 };
 
 // Parser states for streaming parse
