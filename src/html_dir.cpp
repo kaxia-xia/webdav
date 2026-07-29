@@ -1,5 +1,6 @@
 #include "html_dir.h"
 #include "file_ops.h"
+#include "thumbnail.h"
 #include "utils.h"
 #include <cstdio>
 #include <algorithm>
@@ -10,19 +11,24 @@ namespace html_dir {
 static const std::string& cached_css() {
     static const std::string css = [] {
         std::string s;
-        s.reserve(1500);
+        s.reserve(4000);
         s += "  * { box-sizing: border-box; margin: 0; padding: 0; }\r\n";
         s += "  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; "
              "background: #f5f5f5; color: #333; }\r\n";
         s += "  .header { background: #2c3e50; color: white; padding: 16px 24px; }\r\n";
         s += "  .header h1 { font-size: 1.3em; font-weight: 500; }\r\n";
         s += "  .header .server { font-size: 0.85em; opacity: 0.7; margin-top: 4px; }\r\n";
-        s += "  .container { max-width: 960px; margin: 24px auto; padding: 0 16px; }\r\n";
+        s += "  .container { max-width: 1200px; margin: 24px auto; padding: 0 16px; }\r\n";
         s += "  .breadcrumb { background: white; padding: 12px 20px; border-radius: 8px; "
              "margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-size: 0.9em; }\r\n";
         s += "  .breadcrumb a { color: #3498db; text-decoration: none; }\r\n";
         s += "  .breadcrumb a:hover { text-decoration: underline; }\r\n";
         s += "  .breadcrumb span { color: #999; margin: 0 6px; }\r\n";
+        s += "  .section-title { font-size: 1.1em; font-weight: 600; color: #2c3e50; "
+             "padding: 12px 0 8px 0; margin-top: 8px; border-bottom: 2px solid #eee; }\r\n";
+        s += "  .section-title .count { font-weight: 400; color: #888; font-size: 0.85em; }\r\n";
+
+        // ── Table styles (for directories and other files) ──────────────
         s += "  table { width: 100%; background: white; border-radius: 8px; "
              "box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-collapse: collapse; }\r\n";
         s += "  th { text-align: left; padding: 12px 20px; font-size: 0.8em; text-transform: uppercase; "
@@ -35,17 +41,47 @@ static const std::string& cached_css() {
         s += "  .dir a { font-weight: 500; color: #2980b9; }\r\n";
         s += "  .size { color: #888; text-align: right; white-space: nowrap; }\r\n";
         s += "  .date { color: #888; text-align: right; white-space: nowrap; font-size: 0.9em; }\r\n";
+
+        // ── Grid styles (for media files) ────────────────────────────────
+        s += "  .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); "
+             "gap: 16px; margin: 12px 0 20px 0; }\r\n";
+        s += "  .media-card { background: white; border-radius: 10px; overflow: hidden; "
+             "box-shadow: 0 2px 8px rgba(0,0,0,0.08); transition: transform 0.15s, box-shadow 0.15s; "
+             "cursor: pointer; }\r\n";
+        s += "  .media-card:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }\r\n";
+        s += "  .media-card a { text-decoration: none; color: inherit; display: block; }\r\n";
+        s += "  .media-thumb { width: 100%; aspect-ratio: 1; background: #1a1a2e; "
+             "display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }\r\n";
+        s += "  .media-thumb img { width: 100%; height: 100%; object-fit: cover; }\r\n";
+        s += "  .media-thumb .fallback-icon { display: flex; align-items: center; justify-content: center; "
+             "width: 100%; height: 100%; }\r\n";
+        s += "  .media-thumb .fallback-icon svg { width: 64px; height: 64px; opacity: 0.7; }\r\n";
+        s += "  .media-badge { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); "
+             "color: #fff; font-size: 0.7em; padding: 2px 8px; border-radius: 4px; "
+             "text-transform: uppercase; letter-spacing: 0.5px; }\r\n";
+        s += "  .media-duration { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.7); "
+             "color: #fff; font-size: 0.7em; padding: 2px 6px; border-radius: 4px; }\r\n";
+        s += "  .media-info { padding: 10px 12px; }\r\n";
+        s += "  .media-name { font-size: 0.85em; font-weight: 500; color: #2c3e50; "
+             "white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }\r\n";
+        s += "  .media-meta { font-size: 0.75em; color: #888; }\r\n";
+
+        // ── Footer ────────────────────────────────────────────────────────
         s += "  .footer { text-align: center; padding: 24px; color: #aaa; font-size: 0.85em; }\r\n";
+
+        // ── Responsive ────────────────────────────────────────────────────
         s += "  @media (max-width: 600px) {\r\n";
         s += "    .date { display: none; }\r\n";
         s += "    td { padding: 8px 12px; }\r\n";
+        s += "    .media-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }\r\n";
         s += "  }\r\n";
+
         return s;
     }();
     return css;
 }
 
-// ── Helpers (stack-based, no heap allocation in hot path) ────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 static std::string escape_html(std::string_view s) {
     std::string result;
@@ -62,29 +98,52 @@ static std::string escape_html(std::string_view s) {
     return result;
 }
 
-// Check if file is a video or audio file (by extension)
-static bool is_media_ext(const std::string& name) {
-    auto dot = name.rfind('.');
-    if (dot == std::string::npos) return false;
-    std::string ext = name.substr(dot);
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".mp4"  || ext == ".webm" || ext == ".ogv"  ||
-           ext == ".mkv"  || ext == ".avi"  || ext == ".mov"  ||
-           ext == ".mp3"  || ext == ".ogg"  || ext == ".opus" ||
-           ext == ".flac" || ext == ".wav"  || ext == ".aac"  ||
-           ext == ".m4a"  || ext == ".wma";
+// ── SVG fallback icons (inline, base64-encoded for use in <img> tags) ──────
+
+static std::string video_icon_svg() {
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" "
+           "width=\"64\" height=\"64\">"
+           "<rect width=\"128\" height=\"128\" rx=\"12\" fill=\"#2c3e50\"/>"
+           "<polygon points=\"48,32 48,96 100,64\" fill=\"#3498db\" opacity=\"0.8\"/>"
+           "</svg>";
+}
+
+static std::string audio_icon_svg() {
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" "
+           "width=\"64\" height=\"64\">"
+           "<rect width=\"128\" height=\"128\" rx=\"12\" fill=\"#2c3e50\"/>"
+           "<circle cx=\"64\" cy=\"64\" r=\"32\" fill=\"none\" stroke=\"#e74c3c\" stroke-width=\"6\" opacity=\"0.8\"/>"
+           "<circle cx=\"64\" cy=\"64\" r=\"14\" fill=\"#e74c3c\" opacity=\"0.8\"/>"
+           "</svg>";
 }
 
 // ── Main generator ───────────────────────────────────────────────────────────
 
-std::string generate(std::string_view path, const fs::path& resolved_path) {
+std::string generate(std::string_view path, const fs::path& resolved_path,
+                     std::string_view server_origin) {
     auto entries = file_ops::list_directory(resolved_path);
 
-    // Pre-allocate: ~2.8KB fixed HTML + ~160 bytes per entry
-    std::string h;
-    h.reserve(2800 + entries.size() * 160);
+    // ── Separate entries by type ──────────────────────────────────────────
+    std::vector<file_ops::DirEntry> dirs;
+    std::vector<file_ops::DirEntry> media_files;
+    std::vector<file_ops::DirEntry> other_files;
 
-    // Parent path — strip trailing slashes first
+    for (const auto& e : entries) {
+        if (e.is_directory) {
+            dirs.push_back(e);
+        } else if (thumbnail::is_media_file(e.name)) {
+            media_files.push_back(e);
+        } else {
+            other_files.push_back(e);
+        }
+    }
+
+    // Pre-allocate
+    size_t est_size = 4000 + entries.size() * 300;
+    std::string h;
+    h.reserve(est_size);
+
+    // ── Parent path ───────────────────────────────────────────────────────
     std::string parent_path;
     std::string_view clean_path(path);
     while (clean_path.size() > 1 && clean_path.back() == '/')
@@ -103,6 +162,10 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
         display_path += '/';
     }
 
+    // Build thumb prefix for the thumbnail endpoint
+    std::string thumb_prefix(server_origin);
+    thumb_prefix += "/__thumb__?path=";
+
     // ── HTML head ────────────────────────────────────────────────────────
     h += "<!DOCTYPE html>\r\n";
     h += "<html lang=\"en\">\r\n";
@@ -118,19 +181,25 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     h += "</head>\r\n";
     h += "<body>\r\n";
 
-    // Header
+    // ── Header ────────────────────────────────────────────────────────────
     h += "<div class=\"header\">\r\n";
     h += "  <h1>📁 Index of ";
     h += escape_html(display_path);
     h += "</h1>\r\n";
     h += "  <div class=\"server\">WebDAV Server &bull; ";
     h += std::to_string(entries.size());
-    h += " items</div>\r\n";
+    h += " items";
+    if (!media_files.empty()) {
+        h += " (";
+        h += std::to_string(media_files.size());
+        h += " media)";
+    }
+    h += "</div>\r\n";
     h += "</div>\r\n";
 
     h += "<div class=\"container\">\r\n";
 
-    // Breadcrumb
+    // ── Breadcrumb ────────────────────────────────────────────────────────
     h += "<div class=\"breadcrumb\">\r\n";
     h += "  <a href=\"/\">🏠 Home</a>\r\n";
     if (!display_path.empty() && display_path != "/") {
@@ -154,70 +223,141 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     }
     h += "</div>\r\n";
 
-    // Table header
-    h += "<table>\r\n";
-    h += "<thead><tr>"
-         "<th></th><th>Name</th><th class=\"size\">Size</th><th class=\"date\">Modified</th>"
-         "</tr></thead>\r\n";
-    h += "<tbody>\r\n";
+    // ══════════════════════════════════════════════════════════════════════
+    // ── Media Grid Section ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    if (!media_files.empty()) {
+        h += "<div class=\"section-title\">🎬 Media <span class=\"count\">(";
+        h += std::to_string(media_files.size());
+        h += " files)</span></div>\r\n";
+        h += "<div class=\"media-grid\">\r\n";
 
-    // Parent ".." link
-    if (!parent_path.empty() || path == "/") {
-        h += "<tr>";
-        h += "<td class=\"icon\">📂</td>";
-        std::string parent_href;
-        if (parent_path.empty() || parent_path == "/")
-            parent_href = "/";
-        else
-            parent_href = utils::url_encode(parent_path) + '/';
-        h += "<td class=\"name dir\"><a href=\"";
-        h += escape_html(parent_href);
-        h += "\">..</a></td>";
-        h += "<td class=\"size\">—</td>";
-        h += "<td class=\"date\">—</td>";
-        h += "</tr>\r\n";
+        for (const auto& entry : media_files) {
+            bool is_vid = thumbnail::is_video_file(entry.name);
+            std::string badge = is_vid ? "VIDEO" : "AUDIO";
+
+            // Encode the file path for the thumbnail URL
+            std::string file_url = utils::url_encode(display_path) + utils::url_encode(entry.name);
+            std::string thumb_url = thumb_prefix + utils::url_encode(display_path + entry.name);
+
+            h += "<div class=\"media-card\">\r\n";
+            h += "  <a href=\"";
+            h += escape_html(file_url);
+            h += "\">\r\n";
+            h += "    <div class=\"media-thumb\">\r\n";
+            // Use <img> tag pointing to thumbnail endpoint; onerror shows fallback
+            h += "      <img src=\"";
+            h += escape_html(thumb_url);
+            h += "\" alt=\"";
+            h += escape_html(entry.name);
+            h += "\" loading=\"lazy\"";
+            // If server_origin is empty (no thumb support), img will 404 → onerror fallback
+            if (server_origin.empty()) {
+                h += " onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"";
+            } else {
+                h += " onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"";
+            }
+            h += ">\r\n";
+            // Fallback icon (hidden until img fails)
+            h += "      <div class=\"fallback-icon\" style=\"display:none;\">\r\n";
+            if (is_vid) {
+                h += "        " + video_icon_svg() + "\r\n";
+            } else {
+                h += "        " + audio_icon_svg() + "\r\n";
+            }
+            h += "      </div>\r\n";
+            h += "      <span class=\"media-badge\">" + badge + "</span>\r\n";
+            h += "    </div>\r\n";
+            h += "    <div class=\"media-info\">\r\n";
+            h += "      <div class=\"media-name\" title=\"";
+            h += escape_html(entry.name);
+            h += "\">";
+            h += escape_html(entry.name);
+            h += "</div>\r\n";
+            h += "      <div class=\"media-meta\">";
+            h += utils::format_size(entry.size);
+            h += "</div>\r\n";
+            h += "    </div>\r\n";
+            h += "  </a>\r\n";
+            h += "</div>\r\n";
+        }
+
+        h += "</div>\r\n";
     }
 
-    // ── Directory entries ────────────────────────────────────────────────
-    for (const auto& entry : entries) {
-        h += "<tr>";
-        h += "<td class=\"icon\">";
-        if (entry.is_directory) {
-            h += "📁";
-        } else if (is_media_ext(entry.name)) {
-            h += "▶️";
-        } else {
-            h += "📄";
+    // ══════════════════════════════════════════════════════════════════════
+    // ── Directory Table Section ──────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    bool has_dirs_or_other = !dirs.empty() || !other_files.empty();
+    bool has_parent = !parent_path.empty() || path == "/";
+
+    if (has_dirs_or_other || has_parent) {
+        if (!media_files.empty()) {
+            h += "<div class=\"section-title\">📂 Files &amp; Folders</div>\r\n";
         }
-        h += "</td>";
 
-        h += "<td class=\"name";
-        if (entry.is_directory) h += " dir";
-        h += "\"><a href=\"";
-        h += escape_html(utils::url_encode(display_path) + utils::url_encode(entry.name));
-        if (entry.is_directory) h += '/';
-        h += "\">";
-        h += escape_html(entry.name);
-        h += "</a></td>";
+        h += "<table>\r\n";
+        h += "<thead><tr>"
+             "<th></th><th>Name</th><th class=\"size\">Size</th><th class=\"date\">Modified</th>"
+             "</tr></thead>\r\n";
+        h += "<tbody>\r\n";
 
-        if (entry.is_directory) {
+        // Parent ".." link
+        if (has_parent) {
+            h += "<tr>";
+            h += "<td class=\"icon\">📂</td>";
+            std::string parent_href;
+            if (parent_path.empty() || parent_path == "/")
+                parent_href = "/";
+            else
+                parent_href = utils::url_encode(parent_path) + '/';
+            h += "<td class=\"name dir\"><a href=\"";
+            h += escape_html(parent_href);
+            h += "\">..</a></td>";
             h += "<td class=\"size\">—</td>";
-        } else {
+            h += "<td class=\"date\">—</td>";
+            h += "</tr>\r\n";
+        }
+
+        // Directory entries
+        for (const auto& entry : dirs) {
+            h += "<tr>";
+            h += "<td class=\"icon\">📁</td>";
+            h += "<td class=\"name dir\"><a href=\"";
+            h += escape_html(utils::url_encode(display_path) + utils::url_encode(entry.name));
+            h += "/\">";
+            h += escape_html(entry.name);
+            h += "</a></td>";
+            h += "<td class=\"size\">—</td>";
+            h += "<td class=\"date\">";
+            h += utils::rfc1123_time(entry.last_modified);
+            h += "</td>";
+            h += "</tr>\r\n";
+        }
+
+        // Other file entries
+        for (const auto& entry : other_files) {
+            h += "<tr>";
+            h += "<td class=\"icon\">📄</td>";
+            h += "<td class=\"name\"><a href=\"";
+            h += escape_html(utils::url_encode(display_path) + utils::url_encode(entry.name));
+            h += "\">";
+            h += escape_html(entry.name);
+            h += "</a></td>";
             h += "<td class=\"size\">";
             h += utils::format_size(entry.size);
             h += "</td>";
+            h += "<td class=\"date\">";
+            h += utils::rfc1123_time(entry.last_modified);
+            h += "</td>";
+            h += "</tr>\r\n";
         }
 
-        h += "<td class=\"date\">";
-        h += utils::rfc1123_time(entry.last_modified);
-        h += "</td>";
-
-        h += "</tr>\r\n";
+        h += "</tbody>\r\n";
+        h += "</table>\r\n";
     }
 
     // Footer
-    h += "</tbody>\r\n";
-    h += "</table>\r\n";
     h += "<div class=\"footer\">WebDAV Server / C++20</div>\r\n";
     h += "</div>\r\n";
     h += "</body>\r\n";

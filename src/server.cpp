@@ -1,5 +1,6 @@
 #include "server.h"
 #include "http_parser.h"
+#include "thumbnail.h"
 #include "utils.h"
 #include <iostream>
 #include <cstring>
@@ -31,6 +32,9 @@ Server::Server(const fs::path& root_dir, int port, bool allow_browser,
 {
     if (num_workers_ < 1) num_workers_ = 4;
     std::cout << "[INFO] Starting with " << num_workers_ << " worker threads" << std::endl;
+
+    // Initialize thumbnail subsystem
+    thumbnail::init(root_dir);
 }
 
 Server::~Server() {

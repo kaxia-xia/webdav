@@ -2,9 +2,11 @@
 #include "file_ops.h"
 #include "xml_utils.h"
 #include "html_dir.h"
+#include "thumbnail.h"
 #include "utils.h"
 #include <iostream>
 #include <algorithm>
+#include <charconv>
 
 WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
                              std::optional<std::string> username,
@@ -300,6 +302,71 @@ bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_vie
     return djb2_hash(key) == expected_hash;
 }
 
+// ── Thumbnail endpoint ───────────────────────────────────────────────────────
+
+http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
+    // Extract the 'path' query parameter
+    std::string file_path;
+    auto path_start = req.query.find("path=");
+    if (path_start != std::string::npos) {
+        file_path = req.query.substr(path_start + 5); // len("path=")
+        auto amp = file_path.find('&');
+        if (amp != std::string::npos) file_path.resize(amp);
+        file_path = utils::url_decode(file_path);
+    }
+
+    if (file_path.empty()) {
+        return error_response(400, "Bad Request — missing path parameter");
+    }
+
+    // Resolve the file path against root_dir
+    fs::path resolved = file_ops::resolve_path(root_dir_, file_path);
+    if (resolved.empty() || !file_ops::exists(resolved)) {
+        return error_response(404, "Not Found");
+    }
+
+    // Check auth for the target file (or use media token)
+    if (!check_auth(req, resolved)) {
+        http::Response resp;
+        resp.status_code = 401;
+        resp.status_text = "Unauthorized";
+        add_common_headers(resp);
+        resp.set_header("WWW-Authenticate", "Basic realm=\"WebDAV\"");
+        resp.set_content_length(0);
+        return resp;
+    }
+
+    // Extract optional size parameter
+    int size = 256;
+    auto size_start = req.query.find("size=");
+    if (size_start != std::string::npos) {
+        std::string size_str = req.query.substr(size_start + 5);
+        auto amp = size_str.find('&');
+        if (amp != std::string::npos) size_str.resize(amp);
+        if (!size_str.empty()) {
+            int parsed = 0;
+            auto res = std::from_chars(size_str.data(), size_str.data() + size_str.size(), parsed);
+            if (res.ec == std::errc{} && parsed > 0 && parsed <= 1024) {
+                size = parsed;
+            }
+        }
+    }
+
+    // Generate thumbnail
+    std::string thumb_data = thumbnail::generate(resolved, size);
+    std::string mime(thumbnail::mime_type(thumb_data));
+
+    http::Response resp;
+    resp.status_code = 200;
+    add_common_headers(resp);
+    resp.set_content_type(mime);
+    resp.set_content_length(thumb_data.size());
+    // Cache for 1 hour
+    resp.set_header("Cache-Control", "public, max-age=3600");
+    resp.body = std::move(thumb_data);
+    return resp;
+}
+
 http::Response WebDavHandler::handle(const http::Request& req) {
     // Log every request for debugging
     std::cerr << "[REQ] " << req.method_str << " " << req.path
@@ -312,6 +379,11 @@ http::Response WebDavHandler::handle(const http::Request& req) {
         std::cerr << uav;
     }
     std::cerr << ")" << std::endl;
+
+    // ── Thumbnail endpoint (before auth check — uses own token/auth logic) ─
+    if (req.method == http::Method::GET && req.path == "/__thumb__") {
+        return handle_thumbnail(req);
+    }
 
     // ── Resolve path (needed early for token-based auth) ──────────────────
     fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
@@ -380,7 +452,15 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     if (file_ops::is_directory(resolved)) {
         std::string path = req.path;
         if (path.empty()) path = "/";
-        std::string html = html_dir::generate(path, resolved);
+
+        // Build server origin for thumbnail URLs
+        std::string origin;
+        auto host_hdr = req.header("Host");
+        if (host_hdr) {
+            origin = "http://" + std::string(*host_hdr);
+        }
+
+        std::string html = html_dir::generate(path, resolved, origin);
 
         http::Response resp;
         resp.status_code = 200;

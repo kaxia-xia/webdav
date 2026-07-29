@@ -25,6 +25,7 @@ target_sources(webdav-core PRIVATE
     src/webdav_handler.cpp src/webdav_handler.h
     src/xml_utils.cpp      src/xml_utils.h
     src/html_dir.cpp       src/html_dir.h
+    src/thumbnail.cpp      src/thumbnail.h
     src/server.cpp         src/server.h
 )
 

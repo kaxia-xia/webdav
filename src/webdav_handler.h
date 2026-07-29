@@ -47,6 +47,9 @@ private:
     // Serve an HTML5 media player page for video/audio files
     http::Response serve_media_player_page(const http::Request& req, const fs::path& resolved);
 
+    // Serve a thumbnail for a media file
+    http::Response handle_thumbnail(const http::Request& req);
+
     // WebDAV method handlers
     http::Response handle_options(const http::Request& req, const fs::path& resolved);
     http::Response handle_get(const http::Request& req, const fs::path& resolved);
