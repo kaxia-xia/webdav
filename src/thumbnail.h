@@ -26,4 +26,7 @@ bool is_media_file(std::string_view filename);
 // Check if a file is a video file (as opposed to audio)
 bool is_video_file(std::string_view filename);
 
+// Check if a file is an image file (png, jpg, gif, webp, etc.)
+bool is_image_file(std::string_view filename);
+
 } // namespace thumbnail

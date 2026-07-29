@@ -117,6 +117,18 @@ static std::string audio_icon_svg() {
            "</svg>";
 }
 
+static std::string image_icon_svg() {
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" "
+           "width=\"64\" height=\"64\">"
+           "<rect width=\"128\" height=\"128\" rx=\"12\" fill=\"#2c3e50\"/>"
+           "<rect x=\"24\" y=\"20\" width=\"80\" height=\"70\" rx=\"4\" fill=\"none\" "
+           "stroke=\"#27ae60\" stroke-width=\"4\" opacity=\"0.8\"/>"
+           "<circle cx=\"48\" cy=\"44\" r=\"10\" fill=\"#27ae60\" opacity=\"0.7\"/>"
+           "<polygon points=\"24,90 50,60 68,76 88,50 104,70 104,90\" "
+           "fill=\"#27ae60\" opacity=\"0.5\"/>"
+           "</svg>";
+}
+
 // ── Main generator ───────────────────────────────────────────────────────────
 
 std::string generate(std::string_view path, const fs::path& resolved_path,
@@ -234,7 +246,8 @@ std::string generate(std::string_view path, const fs::path& resolved_path,
 
         for (const auto& entry : media_files) {
             bool is_vid = thumbnail::is_video_file(entry.name);
-            std::string badge = is_vid ? "VIDEO" : "AUDIO";
+            bool is_img = thumbnail::is_image_file(entry.name);
+            std::string badge = is_vid ? "VIDEO" : (is_img ? "IMAGE" : "AUDIO");
 
             // Encode the file path for the thumbnail URL
             std::string file_url = utils::url_encode(display_path) + utils::url_encode(entry.name);
@@ -251,17 +264,13 @@ std::string generate(std::string_view path, const fs::path& resolved_path,
             h += "\" alt=\"";
             h += escape_html(entry.name);
             h += "\" loading=\"lazy\"";
-            // If server_origin is empty (no thumb support), img will 404 → onerror fallback
-            if (server_origin.empty()) {
-                h += " onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"";
-            } else {
-                h += " onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"";
-            }
-            h += ">\r\n";
+            h += " onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\">\r\n";
             // Fallback icon (hidden until img fails)
             h += "      <div class=\"fallback-icon\" style=\"display:none;\">\r\n";
             if (is_vid) {
                 h += "        " + video_icon_svg() + "\r\n";
+            } else if (is_img) {
+                h += "        " + image_icon_svg() + "\r\n";
             } else {
                 h += "        " + audio_icon_svg() + "\r\n";
             }

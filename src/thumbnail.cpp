@@ -56,7 +56,8 @@ bool is_media_file(std::string_view filename) {
            ext == ".mkv"  || ext == ".avi"  || ext == ".mov"  ||
            ext == ".mp3"  || ext == ".ogg"  || ext == ".opus" ||
            ext == ".flac" || ext == ".wav"  || ext == ".aac"  ||
-           ext == ".m4a"  || ext == ".wma";
+           ext == ".m4a"  || ext == ".wma"  ||
+           is_image_file(filename);
 }
 
 bool is_video_file(std::string_view filename) {
@@ -66,6 +67,17 @@ bool is_video_file(std::string_view filename) {
     for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return ext == ".mp4"  || ext == ".webm" || ext == ".ogv" ||
            ext == ".mkv"  || ext == ".avi"  || ext == ".mov";
+}
+
+bool is_image_file(std::string_view filename) {
+    auto dot = filename.rfind('.');
+    if (dot == std::string_view::npos) return false;
+    std::string ext(filename.substr(dot));
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".jpg"  || ext == ".jpeg" || ext == ".png"  ||
+           ext == ".gif"  || ext == ".webp" || ext == ".bmp"  ||
+           ext == ".svg"  || ext == ".tiff" || ext == ".tif"  ||
+           ext == ".ico"  || ext == ".heic" || ext == ".heif";
 }
 
 // ── Cache key: hash of file path + mtime ─────────────────────────────────────
@@ -92,13 +104,21 @@ static fs::path cache_path_for(const fs::path& filepath, int size) {
 // ── Run ffmpeg to extract thumbnail ──────────────────────────────────────────
 
 #ifdef __linux__
-static std::string run_ffmpeg_thumbnail(const fs::path& filepath, int size, bool is_video) {
+static std::string run_ffmpeg_thumbnail(const fs::path& filepath, int size, bool is_video, bool is_image) {
     if (!s_ffmpeg_available) return {};
 
     std::string tmp_output = (s_cache_dir / "tmp_thumb.jpg").string();
 
     std::string cmd;
-    if (is_video) {
+    if (is_image) {
+        // Resize image, maintain aspect ratio, good quality
+        char buf[1024];
+        snprintf(buf, sizeof(buf),
+            "ffmpeg -y -i '%s' -vf 'scale=%d:%d:force_original_aspect_ratio=decrease' "
+            "-q:v 3 '%s' 2>/dev/null",
+            filepath.c_str(), size, size, tmp_output.c_str());
+        cmd = buf;
+    } else if (is_video) {
         // Extract frame at 2 seconds (to avoid black first frames)
         char buf[1024];
         snprintf(buf, sizeof(buf),
@@ -118,7 +138,7 @@ static std::string run_ffmpeg_thumbnail(const fs::path& filepath, int size, bool
 
     int ret = std::system(cmd.c_str());
     if (ret != 0 || !fs::exists(tmp_output)) {
-        // Try alternative: extract frame at 0 seconds
+        // Try alternative: extract frame at 0 seconds for video
         if (is_video) {
             char buf2[1024];
             snprintf(buf2, sizeof(buf2),
@@ -126,6 +146,16 @@ static std::string run_ffmpeg_thumbnail(const fs::path& filepath, int size, bool
                 "-q:v 3 '%s' 2>/dev/null",
                 filepath.c_str(), size, size, tmp_output.c_str());
             cmd = buf2;
+            ret = std::system(cmd.c_str());
+        }
+        // For audio: try without -vcodec copy (some files store art differently)
+        if (!is_video && !is_image && (ret != 0 || !fs::exists(tmp_output))) {
+            char buf3[1024];
+            snprintf(buf3, sizeof(buf3),
+                "ffmpeg -y -i '%s' -an -vf 'scale=%d:%d:force_original_aspect_ratio=decrease' "
+                "-q:v 3 '%s' 2>/dev/null",
+                filepath.c_str(), size, size, tmp_output.c_str());
+            cmd = buf3;
             ret = std::system(cmd.c_str());
         }
     }
@@ -149,7 +179,7 @@ static std::string run_ffmpeg_thumbnail(const fs::path& filepath, int size, bool
     return data;
 }
 #else
-static std::string run_ffmpeg_thumbnail(const fs::path&, int, bool) {
+static std::string run_ffmpeg_thumbnail(const fs::path&, int, bool, bool) {
     return {};
 }
 #endif
@@ -184,6 +214,22 @@ static std::string svg_audio_icon(int size) {
     return s;
 }
 
+static std::string svg_image_icon(int size) {
+    std::string s;
+    s.reserve(1024);
+    s += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    s += "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" "
+         "width=\"" + std::to_string(size) + "\" height=\"" + std::to_string(size) + "\">\n";
+    s += "  <rect width=\"128\" height=\"128\" rx=\"12\" fill=\"#2c3e50\"/>\n";
+    s += "  <rect x=\"24\" y=\"20\" width=\"80\" height=\"70\" rx=\"4\" fill=\"none\" "
+         "stroke=\"#27ae60\" stroke-width=\"4\"/>\n";
+    s += "  <circle cx=\"48\" cy=\"44\" r=\"10\" fill=\"#27ae60\" opacity=\"0.8\"/>\n";
+    s += "  <polygon points=\"24,90 50,60 68,76 88,50 104,70 104,90\" "
+         "fill=\"#27ae60\" opacity=\"0.5\"/>\n";
+    s += "</svg>\n";
+    return s;
+}
+
 // ── Main generator ───────────────────────────────────────────────────────────
 
 std::string generate(const fs::path& filepath, int size) {
@@ -203,8 +249,10 @@ std::string generate(const fs::path& filepath, int size) {
     }
 
     // 2. Try ffmpeg
-    bool is_vid = is_video_file(filepath.filename().string());
-    std::string result = run_ffmpeg_thumbnail(filepath, size, is_vid);
+    std::string fname = filepath.filename().string();
+    bool is_vid = is_video_file(fname);
+    bool is_img = is_image_file(fname);
+    std::string result = run_ffmpeg_thumbnail(filepath, size, is_vid, is_img);
 
     if (!result.empty()) {
         // Cache it
@@ -216,11 +264,14 @@ std::string generate(const fs::path& filepath, int size) {
     }
 
     // 3. Fallback: SVG icon
-    // Cache SVG icon too (but as .svg so we know)
-    fs::path svg_cache = s_cache_dir / (cache_key(filepath) + "_" + std::to_string(size) + ".svg");
-    std::string svg = is_vid ? svg_video_icon(size) : svg_audio_icon(size);
-
-    // Don't bother caching SVG — it's fast to generate
+    std::string svg;
+    if (is_vid) {
+        svg = svg_video_icon(size);
+    } else if (is_img) {
+        svg = svg_image_icon(size);
+    } else {
+        svg = svg_audio_icon(size);
+    }
     return svg;
 }
 
