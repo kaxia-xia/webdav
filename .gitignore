@@ -1,0 +1,41 @@
+# Build outputs
+build/
+cmake-build-*/
+out/
+
+# Binaries
+*.o
+*.obj
+*.exe
+webdav-server
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# Archives
+*.a
+*.so
+*.dylib
+*.dll
+
+# Packaging
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# macOS
+.DS_Store

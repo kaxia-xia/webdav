@@ -115,7 +115,7 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             // Generate HTML directory listing
             std::string path = req.path;
             if (path.empty()) path = "/";
-            std::string html = html_dir::generate(path, resolved, root_dir_);
+            std::string html = html_dir::generate(path, resolved);
 
             http::Response resp;
             resp.status_code = 200;
@@ -133,7 +133,7 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             resp.set_content_type("text/html; charset=utf-8");
             std::string path = req.path;
             if (path.empty()) path = "/";
-            std::string html = html_dir::generate(path, resolved, root_dir_);
+            std::string html = html_dir::generate(path, resolved);
             resp.set_content_length(html.size());
             resp.body = std::move(html);
             return resp;

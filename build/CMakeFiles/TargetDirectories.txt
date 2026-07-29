@@ -1,7 +1,0 @@
-/home/kaxia/code/webdav/build/CMakeFiles/webdav-server.dir
-/home/kaxia/code/webdav/build/CMakeFiles/edit_cache.dir
-/home/kaxia/code/webdav/build/CMakeFiles/rebuild_cache.dir
-/home/kaxia/code/webdav/build/CMakeFiles/list_install_components.dir
-/home/kaxia/code/webdav/build/CMakeFiles/install.dir
-/home/kaxia/code/webdav/build/CMakeFiles/install/local.dir
-/home/kaxia/code/webdav/build/CMakeFiles/install/strip.dir

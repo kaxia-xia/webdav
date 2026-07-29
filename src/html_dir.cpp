@@ -38,7 +38,7 @@ static std::string format_size(uintmax_t size) {
     return oss.str();
 }
 
-std::string generate(std::string_view path, const fs::path& resolved_path, const fs::path& root_dir) {
+std::string generate(std::string_view path, const fs::path& resolved_path) {
     auto entries = file_ops::list_directory(resolved_path);
 
     // Compute parent path
