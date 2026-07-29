@@ -46,16 +46,27 @@ bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolve
     if (!auth_hdr) return false;
 
     std::string_view auth = *auth_hdr;
-    if (auth.size() < 6 || !utils::iequals(auth.substr(0, 6), "Basic ")) return false;
+    if (auth.size() < 6 || !utils::iequals(auth.substr(0, 6), "Basic ")) {
+        std::cerr << "[AUTH] Bad auth header: '" << auth << "'" << std::endl;
+        return false;
+    }
 
     std::string decoded = utils::base64_decode(auth.substr(6));
     auto colon = decoded.find(':');
-    if (colon == std::string::npos) return false;
+    if (colon == std::string::npos) {
+        std::cerr << "[AUTH] base64 decoded no colon: '" << decoded << "'" << std::endl;
+        return false;
+    }
 
     std::string user = decoded.substr(0, colon);
     std::string pass = decoded.substr(colon + 1);
 
-    return user == *username_ && pass == *password_;
+    bool ok = (user == *username_ && pass == *password_);
+    if (!ok) {
+        std::cerr << "[AUTH] Credential mismatch: got '" << user << "'/'" << pass
+                  << "' expected '" << *username_ << "'/'" << *password_ << "'" << std::endl;
+    }
+    return ok;
 }
 
 void WebDavHandler::add_common_headers(http::Response& resp) {
@@ -290,6 +301,18 @@ bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_vie
 }
 
 http::Response WebDavHandler::handle(const http::Request& req) {
+    // Log every request for debugging
+    std::cerr << "[REQ] " << req.method_str << " " << req.path
+              << " (Auth: " << (req.header("Authorization").has_value() ? "yes" : "no")
+              << ", UA: ";
+    auto ua = req.header("User-Agent");
+    if (ua) {
+        std::string_view uav = *ua;
+        if (uav.size() > 60) uav = uav.substr(0, 60);
+        std::cerr << uav;
+    }
+    std::cerr << ")" << std::endl;
+
     // ── Resolve path (needed early for token-based auth) ──────────────────
     fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
     if (resolved.empty()) {
@@ -305,6 +328,9 @@ http::Response WebDavHandler::handle(const http::Request& req) {
 
     // ── Auth check (skip for OPTIONS) ────────────────────────────────────
     if (!is_options && !check_auth(req, resolved)) {
+        std::cerr << "[AUTH] 401 for " << req.method_str << " " << req.path
+                  << " (Authorization: " << (req.header("Authorization").has_value() ? "present" : "missing") << ")"
+                  << std::endl;
         http::Response resp;
         resp.status_code = 401;
         resp.status_text = "Unauthorized";
