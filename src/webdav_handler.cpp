@@ -86,7 +86,8 @@ bool WebDavHandler::is_browser_request(const http::Request& req) {
             uav.find("Chrome")    != std::string_view::npos ||
             uav.find("Safari")    != std::string_view::npos ||
             uav.find("Firefox")   != std::string_view::npos ||
-            uav.find("Edge")      != std::string_view::npos) {
+            uav.find("Edge")      != std::string_view::npos ||
+            uav.find("Edg")       != std::string_view::npos) {
             return true;
         }
     }

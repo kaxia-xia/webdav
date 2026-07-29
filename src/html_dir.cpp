@@ -88,14 +88,17 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     std::string h;
     h.reserve(2800 + entries.size() * 160);
 
-    // Parent path
+    // Parent path — strip trailing slashes first
     std::string parent_path;
-    if (path != "/") {
-        auto last_slash = path.rfind('/');
+    std::string_view clean_path(path);
+    while (clean_path.size() > 1 && clean_path.back() == '/')
+        clean_path.remove_suffix(1);
+    if (!clean_path.empty() && clean_path != "/") {
+        auto last_slash = clean_path.rfind('/');
         if (last_slash == 0) {
             parent_path = "/";
         } else if (last_slash != std::string_view::npos) {
-            parent_path = std::string(path.substr(0, last_slash));
+            parent_path = std::string(clean_path.substr(0, last_slash));
         }
     }
 
@@ -166,8 +169,13 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
     if (!parent_path.empty() || path == "/") {
         h += "<tr>";
         h += "<td class=\"icon\">📂</td>";
+        std::string parent_href;
+        if (parent_path.empty() || parent_path == "/")
+            parent_href = "/";
+        else
+            parent_href = utils::url_encode(parent_path) + '/';
         h += "<td class=\"name dir\"><a href=\"";
-        h += escape_html(parent_path.empty() ? "/" : utils::url_encode(parent_path));
+        h += escape_html(parent_href);
         h += "\">..</a></td>";
         h += "<td class=\"size\">—</td>";
         h += "<td class=\"date\">—</td>";
@@ -185,6 +193,7 @@ std::string generate(std::string_view path, const fs::path& resolved_path) {
         if (entry.is_directory) h += " dir";
         h += "\"><a href=\"";
         h += escape_html(utils::url_encode(display_path) + utils::url_encode(entry.name));
+        if (entry.is_directory) h += '/';
         h += "\">";
         h += escape_html(entry.name);
         h += "</a></td>";
