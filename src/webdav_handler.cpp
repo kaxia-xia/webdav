@@ -47,6 +47,20 @@ static std::string escape_html(std::string_view s) {
     return result;
 }
 
+// ── Trailing slash helper ────────────────────────────────────────────────────
+
+// std::filesystem::path::parent_path() treats "foo/" as having filename ""
+// and returns "foo" as the parent — which is wrong for our use case.
+// This strips trailing slashes so parent_path() returns the real parent.
+static fs::path strip_trailing_slash(const fs::path& p) {
+    std::string s = p.string();
+    if (s.size() > 1 && s.back() == '/') {
+        // Also strip the root path case (should never happen)
+        return s.substr(0, s.size() - 1);
+    }
+    return p;
+}
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolved_path) {
@@ -484,16 +498,18 @@ http::Response WebDavHandler::handle_head(const http::Request& req, const fs::pa
 }
 
 http::Response WebDavHandler::handle_put(const http::Request& req, const fs::path& resolved) {
-    auto parent = resolved.parent_path();
+    fs::path normalized = strip_trailing_slash(resolved);
+
+    auto parent = normalized.parent_path();
     if (!file_ops::exists(parent)) {
         file_ops::create_directory(parent);
     }
 
-    bool existed = file_ops::exists(resolved);
+    bool existed = file_ops::exists(normalized);
 
     // If overwriting an existing file, check it's not in use
-    if (existed && file_ops::is_regular_file(resolved)) {
-        int lock_fd = file_ops::try_lock_exclusive(resolved);
+    if (existed && file_ops::is_regular_file(normalized)) {
+        int lock_fd = file_ops::try_lock_exclusive(normalized);
         if (lock_fd == -1) {
             return error_response(423, "Locked — file is being read");
         }
@@ -505,7 +521,7 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
 
     // ── Small body: handle in memory (existing behavior) ──────────────────
     if (body_size <= STREAMING_PUT_THRESHOLD) {
-        if (!file_ops::write_file(resolved, req.body)) {
+        if (!file_ops::write_file(normalized, req.body)) {
             return error_response(507, "Insufficient Storage");
         }
         http::Response resp;
@@ -517,7 +533,7 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
 
     // ── Large body: stream to disk ────────────────────────────────────────
     // Open temp file alongside destination
-    fs::path tmp_path(resolved.string() + ".webdav-tmp." + std::to_string(getpid()));
+    fs::path tmp_path(normalized.string() + ".webdav-tmp." + std::to_string(getpid()));
     int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         return error_response(507, "Insufficient Storage — cannot create temp file");
@@ -530,7 +546,7 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
     resp.set_content_length(0);
     resp.body_output_fd = fd;
     resp.body_expected = body_size;
-    resp.body_output_path = resolved.string();  // rename tmp → this on success
+    resp.body_output_path = normalized.string();  // rename tmp → this on success
     return resp;
 }
 
@@ -565,16 +581,22 @@ http::Response WebDavHandler::handle_delete(const http::Request& req, const fs::
 
 http::Response WebDavHandler::handle_mkcol(const http::Request& req, const fs::path& resolved) {
     (void)req;
-    if (file_ops::exists(resolved)) {
+
+    // Strip trailing slash(es) so parent_path() returns the real parent.
+    // std::filesystem treats "foo/" as having an empty filename, so
+    // parent_path() on "foo/" returns "foo" instead of the actual parent.
+    fs::path normalized = strip_trailing_slash(resolved);
+
+    if (file_ops::exists(normalized)) {
         return error_response(405, "Method Not Allowed");
     }
 
-    auto parent = resolved.parent_path();
+    auto parent = normalized.parent_path();
     if (!file_ops::exists(parent)) {
         return error_response(409, "Conflict — parent does not exist");
     }
 
-    if (!file_ops::create_directory(resolved)) {
+    if (!file_ops::create_directory(normalized)) {
         return error_response(507, "Insufficient Storage");
     }
 
@@ -622,9 +644,9 @@ http::Response WebDavHandler::handle_move(const http::Request& req, const fs::pa
     if (dest_resolved.empty()) {
         return error_response(403, "Forbidden");
     }
+    dest_resolved = strip_trailing_slash(dest_resolved);
 
-    if (!file_ops::exists(resolved)) {
-        return error_response(404, "Not Found");
+    if (!file_ops::exists(resolved)) {        return error_response(404, "Not Found");
     }
 
     if (file_ops::is_regular_file(resolved)) {
@@ -686,6 +708,7 @@ http::Response WebDavHandler::handle_copy(const http::Request& req, const fs::pa
     if (dest_resolved.empty()) {
         return error_response(403, "Forbidden");
     }
+    dest_resolved = strip_trailing_slash(dest_resolved);
 
     if (!file_ops::exists(resolved)) {
         return error_response(404, "Not Found");
