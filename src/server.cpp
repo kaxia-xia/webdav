@@ -21,9 +21,7 @@
 #include <liburing.h>
 #pragma GCC diagnostic pop
 
-// ── Constants ────────────────────────────────────────────────────────────────
 static constexpr unsigned RING_ENTRIES     = 512;
-static constexpr unsigned CQE_BATCH        = 64;
 static constexpr unsigned IDLE_TIMEOUT_SEC = 30;
 static constexpr int      SVR_TCP_KEEPIDLE  = 60;
 static constexpr int      SVR_TCP_KEEPINTVL = 10;
@@ -34,7 +32,6 @@ static constexpr size_t   BUF_SIZE         = Server::READ_BUF_SIZE;
 static constexpr uintptr_t TAG_ACCEPT  = 1;
 static constexpr uintptr_t TAG_TIMEOUT = 2;
 
-// ── Cached Date ─────────────────────────────────────────────────────────────
 static thread_local time_t tls_cached_epoch = 0;
 static thread_local char   tls_cached_date[40];
 
@@ -56,8 +53,6 @@ static std::string_view get_cached_date() {
     return std::string_view(tls_cached_date);
 }
 
-// ── Constructor / Destructor ─────────────────────────────────────────────────
-
 Server::Server(const fs::path& root_dir, int port, bool allow_browser,
               std::optional<std::string> username,
               std::optional<std::string> password)
@@ -66,8 +61,8 @@ Server::Server(const fs::path& root_dir, int port, bool allow_browser,
     , num_workers_(std::thread::hardware_concurrency())
 {
     if (num_workers_ < 1) num_workers_ = 4;
-    std::cout << "[INFO] " << num_workers_ << " workers | io_uring "
-              << "(DEFER_TASKRUN + accept+recv timeout + HARDLINK splice + pool)" << std::endl;
+    std::cout << "[INFO] " << num_workers_ << " workers, io_uring backend "
+              << "(DEFER_TASKRUN + SO_REUSEPORT + async openat)" << std::endl;
     thumbnail::init();
 }
 
@@ -75,16 +70,11 @@ Server::~Server() { shutdown(); }
 
 void Server::shutdown() {
     if (!running_.exchange(false)) return;
-    for (int fd : listen_fds_) {
-        if (fd >= 0) ::close(fd);
-    }
+    for (int fd : listen_fds_) if (fd >= 0) ::close(fd);
     listen_fds_.clear();
 }
 
-// ── Per-worker thread-local state ───────────────────────────────────────────
 static thread_local struct io_uring* tls_ring = nullptr;
-static thread_local unsigned         tls_conn_count = 0;
-static thread_local void*            tls_pool = nullptr;  // cast to Connection* in worker_loop
 
 static void uring_async_close(int fd) {
     if (fd < 0) return;
@@ -95,15 +85,13 @@ static void uring_async_close(int fd) {
     sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
 }
 
-// ── Socket setup ────────────────────────────────────────────────────────────
-
 void Server::set_socket_options(int fd) {
     struct timeval tv{30, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-    int idle  = SVR_TCP_KEEPIDLE, intvl = SVR_TCP_KEEPINTVL, cnt = SVR_TCP_KEEPCNT;
+    int idle = SVR_TCP_KEEPIDLE, intvl = SVR_TCP_KEEPINTVL, cnt = SVR_TCP_KEEPCNT;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
@@ -113,9 +101,8 @@ std::string Server::build_response_string(int code, bool keep_alive) {
     const char* st   = http::status_message(code);
     auto        d    = get_cached_date();
     const char* conn = keep_alive ? "keep-alive" : "close";
-    std::string r;
-    r.reserve(200);
-    r  = "HTTP/1.1 "; r += std::to_string(code); r += " "; r += st;
+    std::string r; r.reserve(200);
+    r = "HTTP/1.1 "; r += std::to_string(code); r += " "; r += st;
     r += "\r\nServer: WebDAV-Server/1.7\r\nDate: ";
     r.append(d.data(), d.size());
     r += "\r\nAccept-Ranges: bytes\r\nConnection: "; r += conn;
@@ -133,14 +120,10 @@ static int create_listen_socket(int port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ::close(fd); return -1;
-    }
+    if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ::close(fd); return -1; }
     if (::listen(fd, SOMAXCONN) < 0) { ::close(fd); return -1; }
     return fd;
 }
-
-// ── Worker thread ───────────────────────────────────────────────────────────
 
 void Server::worker_loop(unsigned worker_id, int listen_fd) {
     {
@@ -154,34 +137,15 @@ void Server::worker_loop(unsigned worker_id, int listen_fd) {
     struct io_uring ring;
     struct io_uring_params params = {};
     params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+
     int ret = io_uring_queue_init_params(RING_ENTRIES, &ring, &params);
+    tls_ring = &ring;
     if (ret < 0) {
         std::cerr << "[W" << worker_id << "] uring: " << std::strerror(-ret) << std::endl;
         return;
     }
-    tls_ring = &ring;
 
-    // ── Connection pool (inside member function → access to private Connection) ─
-    auto pool_alloc = [&]() -> Connection* {
-        if (tls_pool) {
-            auto* c = static_cast<Connection*>(tls_pool);
-            tls_pool = c->pool_next;
-            return new (c) Connection;
-        }
-        auto* block = new Connection[POOL_BLOCK];
-        for (unsigned i = 1; i < POOL_BLOCK; i++) {
-            block[i].pool_next = static_cast<Connection*>(tls_pool);
-            tls_pool = &block[i];
-        }
-        return &block[0];
-    };
-    auto pool_free = [&](Connection* c) {
-        c->pool_next = static_cast<Connection*>(tls_pool);
-        tls_pool = c;
-    };
-
-    // ── kill_conn: close all fds, free back to pool ─────────────────────
-    auto kill_conn = [&](Connection* c) {
+    auto kill_conn = [&](Server::Connection* c) {
         uring_async_close(c->fd);         c->fd = -1;
         uring_async_close(c->file_fd);    c->file_fd = -1;
         uring_async_close(c->output_fd);  c->output_fd = -1;
@@ -191,13 +155,11 @@ void Server::worker_loop(unsigned worker_id, int listen_fd) {
             ::unlink(c->output_tmp_path.c_str());
             c->output_tmp_path.clear();
         }
-        if (tls_conn_count > 0) tls_conn_count--;
-        pool_free(c);
+        delete c;
     };
 
-    // ── reset_conn: reuse for keep-alive ────────────────────────────────
-    auto reset_conn = [&](Connection* c) {
-        c->state = State::READING_REQUEST;
+    auto reset_conn = [&](Server::Connection* c) {
+        c->state = Server::State::READING_REQUEST;
         c->read_offset = 0; c->parser.reset();
         c->response_data.clear(); c->send_offset = 0;
         c->keep_alive = true; c->recv_has_timeout = false;
@@ -205,223 +167,141 @@ void Server::worker_loop(unsigned worker_id, int listen_fd) {
         uring_async_close(c->splice_pipe[0]); c->splice_pipe[0] = -1;
         uring_async_close(c->splice_pipe[1]); c->splice_pipe[1] = -1;
         c->file_remaining = 0; c->splice_pending = 0;
-        c->splice_phase = SplicePhase::TO_PIPE; c->file_path.clear();
+        c->splice_phase = Server::SplicePhase::TO_PIPE; c->file_path.clear();
         uring_async_close(c->output_fd);  c->output_fd = -1;
         c->body_expected = 0; c->body_received = 0;
         c->put_write_pending = false; c->put_write_size = 0;
         c->output_tmp_path.clear(); c->output_final_path.clear();
     };
 
-    auto cleanup_rb = [&](Connection* c) {
+    auto cleanup_rb = [&](Server::Connection* c) {
         uring_async_close(c->output_fd); c->output_fd = -1;
         if (!c->output_tmp_path.empty()) ::unlink(c->output_tmp_path.c_str());
         kill_conn(c);
     };
 
-    // ── Submit helpers ─────────────────────────────────────────────────
+    // get SQE
     auto sqe = [&]() { return io_uring_get_sqe(&ring); };
 
-    auto s_accept = [&]() {
+    // ── Kick off multishot accept ───────────────────────────────────────
+    {
         struct io_uring_sqe* s = sqe();
-        if (!s) return;
-        io_uring_prep_multishot_accept(s, listen_fd, nullptr, nullptr, 0);
-        io_uring_sqe_set_data(s, reinterpret_cast<void*>(TAG_ACCEPT));
-    };
-
-    // recv + linked idle timeout
-    auto s_recv_to = [&](Connection* c) -> bool {
-        struct io_uring_sqe* s1 = sqe(), *s2 = sqe();
-        if (!s1) return false;
-        if (!s2) {
-            io_uring_prep_recv(s1, c->fd, c->read_buf + c->read_offset,
-                               BUF_SIZE - c->read_offset, 0);
-            io_uring_sqe_set_data(s1, c);
-            c->recv_has_timeout = false;
-            return true;
+        if (s) {
+            io_uring_prep_multishot_accept(s, listen_fd, nullptr, nullptr, 0);
+            io_uring_sqe_set_data(s, reinterpret_cast<void*>(TAG_ACCEPT));
+            io_uring_submit(&ring);
         }
-        io_uring_prep_recv(s1, c->fd, c->read_buf + c->read_offset,
-                           BUF_SIZE - c->read_offset, 0);
-        io_uring_sqe_set_data(s1, c);
-        s1->flags |= IOSQE_IO_LINK;
-        struct __kernel_timespec ts = {.tv_sec = IDLE_TIMEOUT_SEC, .tv_nsec = 0};
-        io_uring_prep_link_timeout(s2, &ts, 0);
-        io_uring_sqe_set_data(s2,
-            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(c) | TAG_TIMEOUT));
-        c->recv_has_timeout = true;
-        return true;
-    };
-
-    auto s_send = [&](Connection* c) -> bool {
-        struct io_uring_sqe* s = sqe();
-        if (!s) return false;
-        size_t len = c->response_data.size() - c->send_offset;
-        io_uring_prep_send(s, c->fd,
-                           c->response_data.data() + c->send_offset,
-                           len > 0 ? len : 0, MSG_NOSIGNAL);
-        io_uring_sqe_set_data(s, c);
-        return true;
-    };
-
-    // ── Splice HARDLINK: file→pipe ⟹ pipe→socket, single CQE ──────────
-    auto s_splice_linked = [&](Connection* c) -> bool {
-        size_t chunk = c->file_remaining;
-        if (chunk > PIPE_CAPACITY) chunk = PIPE_CAPACITY;
-        c->splice_pending = chunk;
-
-        struct io_uring_sqe* s1 = sqe(), *s2 = sqe();
-        if (!s1) return false;
-        if (!s2) {
-            io_uring_prep_splice(s1, c->file_fd, c->file_off,
-                                 c->splice_pipe[1], -1,
-                                 static_cast<unsigned>(chunk),
-                                 SPLICE_F_MOVE | SPLICE_F_MORE);
-            io_uring_sqe_set_data(s1, c);
-            c->splice_phase = SplicePhase::TO_PIPE;
-            return true;
-        }
-        io_uring_prep_splice(s1, c->file_fd, c->file_off,
-                             c->splice_pipe[1], -1,
-                             static_cast<unsigned>(chunk),
-                             SPLICE_F_MOVE | SPLICE_F_MORE);
-        io_uring_sqe_set_data(s1, c);
-        s1->flags |= IOSQE_IO_HARDLINK;
-        io_uring_prep_splice(s2, c->splice_pipe[0], -1,
-                             c->fd, -1, static_cast<unsigned>(chunk),
-                             SPLICE_F_MOVE | SPLICE_F_MORE);
-        io_uring_sqe_set_data(s2, c);
-        c->splice_phase = SplicePhase::TO_SOCKET;
-        return true;
-    };
-
-    auto s_splice_sock = [&](Connection* c) -> bool {
-        struct io_uring_sqe* s = sqe();
-        if (!s) return false;
-        io_uring_prep_splice(s, c->splice_pipe[0], -1,
-                             c->fd, -1,
-                             static_cast<unsigned>(c->splice_pending),
-                             SPLICE_F_MOVE | SPLICE_F_MORE);
-        io_uring_sqe_set_data(s, c);
-        return true;
-    };
-
-    auto s_write = [&](Connection* c) -> bool {
-        struct io_uring_sqe* s = sqe();
-        if (!s) return false;
-        io_uring_prep_write(s, c->output_fd, c->read_buf, c->put_write_size, -1);
-        io_uring_sqe_set_data(s, c);
-        return true;
-    };
-
-    auto s_openat = [&](Connection* c) -> bool {
-        struct io_uring_sqe* s = sqe();
-        if (!s) return false;
-        io_uring_prep_openat(s, AT_FDCWD, c->file_path.c_str(), O_RDONLY, 0);
-        io_uring_sqe_set_data(s, c);
-        return true;
-    };
-
-    // ── Go ─────────────────────────────────────────────────────────────
-    s_accept();
-    io_uring_submit(&ring);
-
-    struct io_uring_cqe* cqe_batch[CQE_BATCH];
+    }
 
     while (running_) {
-        ret = io_uring_submit_and_wait(&ring, 1);
+        struct io_uring_cqe* cqe;
+        ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0) {
             if (ret == -EINTR) continue;
             if (ret == -EBADF || ret == -EINVAL) break;
             break;
         }
 
-        unsigned batch = io_uring_peek_batch_cqe(&ring, cqe_batch, CQE_BATCH);
-        for (unsigned i = 0; i < batch; i++) {
-            struct io_uring_cqe* cqe = cqe_batch[i];
-            uintptr_t ud = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
-            int      res = cqe->res;
-            unsigned flg = cqe->flags;
+        uintptr_t ud = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+        int      res = cqe->res;
+        unsigned flg = cqe->flags;
 
-            // timeout
-            if (ud & TAG_TIMEOUT) {
-                auto* c = reinterpret_cast<Connection*>(ud & ~TAG_TIMEOUT);
-                c->recv_has_timeout = false;
-                if (res == -ETIME && c->state == State::READING_REQUEST) kill_conn(c);
-                continue;
+        if (ud & TAG_TIMEOUT) {
+            auto* c = reinterpret_cast<Server::Connection*>(ud & ~TAG_TIMEOUT);
+            c->recv_has_timeout = false;
+            if (res == -ETIME && c->state == Server::State::READING_REQUEST) kill_conn(c);
+            goto done_cqe;
+        }
+
+        if (ud == TAG_ACCEPT) {
+            if (res >= 0) {
+                set_socket_options(res);
+                auto* conn = new Server::Connection;
+                conn->fd = res;
+                // plain recv (no timeout on first recv — will arm on keep-alive)
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_recv(s, conn->fd, conn->read_buf, BUF_SIZE, 0);
+                    io_uring_sqe_set_data(s, conn);
+                } else { kill_conn(conn); }
             }
-            // accept
-            if (ud == TAG_ACCEPT) {
-                if (res >= 0) {
-                    if (tls_conn_count >= MAX_CONNS_PER_WORKER) {
-                        ::close(res);
-                    } else {
-                        set_socket_options(res);
-                        auto* c = pool_alloc();
-                        c->fd = res;
-                        tls_conn_count++;
-                        if (!s_recv_to(c)) kill_conn(c);
-                    }
+            if (!(flg & IORING_CQE_F_MORE)) {
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_multishot_accept(s, listen_fd, nullptr, nullptr, 0);
+                    io_uring_sqe_set_data(s, reinterpret_cast<void*>(TAG_ACCEPT));
                 }
-                if (!(flg & IORING_CQE_F_MORE)) s_accept();
-                continue;
             }
-            if (ud == 0) continue;
+            goto done_cqe;
+        }
 
-            auto* c = reinterpret_cast<Connection*>(ud);
+        if (ud == 0) goto done_cqe;
 
-            switch (c->state) {
+        {
+        auto* c = reinterpret_cast<Server::Connection*>(ud);
 
-            case State::READING_REQUEST: {
-                if (res <= 0) { kill_conn(c); continue; }
-                c->recv_has_timeout = false;
-                c->read_offset += static_cast<size_t>(res);
+        switch (c->state) {
 
-                std::string_view data(c->read_buf, c->read_offset);
-                if (!c->parser.parse(data, STREAM_THRESHOLD)) {
-                    if (c->read_offset >= BUF_SIZE) { kill_conn(c); continue; }
-                    if (!s_recv_to(c)) kill_conn(c);
-                    continue;
-                }
+        case Server::State::READING_REQUEST: {
+            if (res <= 0) { kill_conn(c); break; }
+            c->recv_has_timeout = false;
+            c->read_offset += static_cast<size_t>(res);
+            std::string_view data(c->read_buf, c->read_offset);
 
-                const auto& req = c->parser.request();
+            if (!c->parser.parse(data, STREAM_THRESHOLD)) {
+                if (c->read_offset >= BUF_SIZE) { kill_conn(c); break; }
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_recv(s, c->fd, c->read_buf + c->read_offset,
+                                       BUF_SIZE - c->read_offset, 0);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
+                break;
+            }
 
-                // PUT streaming
-                if (req.body_truncated && req.method == http::Method::PUT) {
-                    http::Response resp = handler_.handle(req);
-                    if (resp.body_output_fd >= 0) {
-                        c->state = State::RECEIVING_BODY;
-                        c->output_fd = resp.body_output_fd;
-                        c->output_final_path = std::move(resp.body_output_path);
-                        c->output_tmp_path   = std::move(resp.body_tmp_path);
-                        c->body_expected  = resp.body_expected;
-                        c->body_received  = 0;
-                        c->existed_before_put = (resp.status_code == 200);
-                        c->put_write_pending  = false;
+            const auto& req = c->parser.request();
 
-                        std::string_view lv = c->parser.leftover();
-                        if (!lv.empty()) {
-                            c->put_write_size = lv.size();
-                            memmove(c->read_buf, lv.data(), lv.size());
-                            c->body_received = lv.size();
-                            c->put_write_pending = true;
-                            if (!s_write(c)) { cleanup_rb(c); continue; }
-                            continue;
-                        }
-                        c->read_offset = 0;
-                        if (!s_recv_to(c)) { cleanup_rb(c); continue; }
-                        continue;
+            if (req.body_truncated && req.method == http::Method::PUT) {
+                http::Response resp = handler_.handle(req);
+                if (resp.body_output_fd >= 0) {
+                    c->state = Server::State::RECEIVING_BODY;
+                    c->output_fd = resp.body_output_fd;
+                    c->output_final_path = std::move(resp.body_output_path);
+                    c->output_tmp_path   = std::move(resp.body_tmp_path);
+                    c->body_expected  = resp.body_expected;
+                    c->body_received  = 0;
+                    c->existed_before_put = (resp.status_code == 200);
+                    c->put_write_pending  = false;
+
+                    std::string_view lv = c->parser.leftover();
+                    if (!lv.empty()) {
+                        c->put_write_size = lv.size();
+                        memmove(c->read_buf, lv.data(), lv.size());
+                        c->body_received = lv.size();
+                        c->put_write_pending = true;
+                        struct io_uring_sqe* s = sqe();
+                        if (s) {
+                            io_uring_prep_write(s, c->output_fd, c->read_buf, c->put_write_size, -1);
+                            io_uring_sqe_set_data(s, c);
+                        } else cleanup_rb(c);
+                        break;
                     }
-                    c->state = State::SENDING_HEADERS;
-                    c->response_data = resp.to_string();
-                    c->send_offset = 0;
-                    auto ch = req.header("Connection");
-                    if (ch && utils::iequals(*ch, "close")) c->keep_alive = false;
-                    if (!s_send(c)) kill_conn(c);
-                    continue;
+                    c->read_offset = 0;
+                    struct io_uring_sqe* s = sqe();
+                    if (s) {
+                        io_uring_prep_recv(s, c->fd, c->read_buf, BUF_SIZE, 0);
+                        io_uring_sqe_set_data(s, c);
+                    } else cleanup_rb(c);
+                    break;
                 }
+                goto send_response;
+            }
 
-                // Normal request
-                {
-                    http::Response resp = handler_.handle(req);
+send_response:
+            {
+                http::Response resp = c->state == Server::State::SENDING_HEADERS
+                    ? http::Response{} : handler_.handle(req);
+                if (c->state == Server::State::READING_REQUEST) {
                     auto ch = req.header("Connection");
                     if (ch && utils::iequals(*ch, "close")) {
                         c->keep_alive = false;
@@ -429,148 +309,225 @@ void Server::worker_loop(unsigned worker_id, int listen_fd) {
                     } else {
                         resp.set_header("Connection", "keep-alive");
                     }
-                    c->response_data = resp.to_string();
-                    c->send_offset = 0;
 
+                    // File send: async openat
                     if (resp.file_to_send) {
                         c->file_path = std::move(*resp.file_to_send);
                         c->file_off  = resp.file_offset;
                         c->file_remaining = resp.content_length_opt().value_or(0);
-                        c->state = State::OPENING_FILE;
-                        if (s_openat(c)) continue;
-                        // sync fallback
+                        c->response_data = resp.to_string();
+                        c->send_offset = 0;
+
+                        struct io_uring_sqe* s = sqe();
+                        if (s) {
+                            io_uring_prep_openat(s, AT_FDCWD, c->file_path.c_str(), O_RDONLY, 0);
+                            io_uring_sqe_set_data(s, c);
+                            c->state = Server::State::OPENING_FILE;
+                            break;
+                        }
+                        // fallback sync
                         c->file_fd = ::open(c->file_path.c_str(), O_RDONLY);
-                        if (c->file_fd < 0) { kill_conn(c); continue; }
+                        if (c->file_fd < 0) { kill_conn(c); break; }
                         file_ops::lock_shared_nb(c->file_fd);
-                        if (::pipe2(c->splice_pipe, O_NONBLOCK) < 0) { kill_conn(c); continue; }
+                        if (::pipe2(c->splice_pipe, O_NONBLOCK) < 0) { kill_conn(c); break; }
                         ::fcntl(c->splice_pipe[0], F_SETPIPE_SZ, PIPE_CAPACITY);
                         ::fcntl(c->splice_pipe[1], F_SETPIPE_SZ, PIPE_CAPACITY);
-                        c->splice_phase = SplicePhase::TO_PIPE;
-                        c->state = State::SENDING_HEADERS;
-                        if (!s_send(c)) kill_conn(c);
-                        continue;
+                        c->splice_phase = Server::SplicePhase::TO_PIPE;
                     }
-                    c->state = State::SENDING_HEADERS;
-                    if (!s_send(c)) kill_conn(c);
-                }
-                continue;
-            }
 
-            case State::OPENING_FILE: {
-                if (res < 0) {
-                    c->state = State::SENDING_HEADERS;
-                    if (!s_send(c)) kill_conn(c);
-                    continue;
+                    c->response_data = c->response_data.empty()
+                        ? resp.to_string() : c->response_data;
+                    c->send_offset = 0;
                 }
-                c->file_fd = res;
-                file_ops::lock_shared_nb(c->file_fd);
-                if (::pipe2(c->splice_pipe, O_NONBLOCK) < 0) { kill_conn(c); continue; }
-                ::fcntl(c->splice_pipe[0], F_SETPIPE_SZ, PIPE_CAPACITY);
-                ::fcntl(c->splice_pipe[1], F_SETPIPE_SZ, PIPE_CAPACITY);
-                c->state = State::SENDING_HEADERS;
-                if (!s_send(c)) kill_conn(c);
-                continue;
-            }
 
-            case State::RECEIVING_BODY: {
-                if (c->put_write_pending) {
-                    c->put_write_pending = false;
-                    if (res < 0) { cleanup_rb(c); continue; }
-                    if (static_cast<size_t>(res) < c->put_write_size) {
-                        size_t wrote = static_cast<size_t>(res);
-                        c->body_received -= (c->put_write_size - wrote);
-                        size_t r = c->put_write_size - wrote;
-                        memmove(c->read_buf, c->read_buf + wrote, r);
-                        c->put_write_size = r;
-                        c->put_write_pending = true;
-                        if (!s_write(c)) { cleanup_rb(c); continue; }
-                        continue;
-                    }
-                    if (c->body_received >= c->body_expected) {
-                        uring_async_close(c->output_fd); c->output_fd = -1;
-                        if (!c->output_tmp_path.empty() && !c->output_final_path.empty())
-                            ::rename(c->output_tmp_path.c_str(), c->output_final_path.c_str());
-                        c->output_tmp_path.clear(); c->output_final_path.clear();
-                        c->response_data = build_response_string(
-                            c->existed_before_put ? 200 : 201, c->keep_alive);
-                        c->send_offset = 0;
-                        c->state = State::SENDING_HEADERS;
-                        if (!s_send(c)) kill_conn(c);
-                        continue;
-                    }
-                    c->read_offset = 0;
-                    if (!s_recv_to(c)) { cleanup_rb(c); continue; }
-                    continue;
-                }
-                if (res <= 0) { cleanup_rb(c); continue; }
-                c->put_write_size = static_cast<size_t>(res);
-                c->put_write_pending = true;
-                c->body_received += static_cast<size_t>(res);
-                if (!s_write(c)) { cleanup_rb(c); continue; }
-                continue;
+                c->state = Server::State::SENDING_HEADERS;
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    size_t len = c->response_data.size();
+                    io_uring_prep_send(s, c->fd, c->response_data.data(), len, MSG_NOSIGNAL);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
             }
+            break;
+        }
 
-            case State::SENDING_HEADERS: {
-                if (res <= 0) { kill_conn(c); continue; }
-                c->send_offset += static_cast<size_t>(res);
-                if (c->send_offset < c->response_data.size()) {
-                    if (!s_send(c)) kill_conn(c);
-                    continue;
-                }
-                if (c->file_fd >= 0 && c->file_remaining > 0) {
-                    c->state = State::SENDING_FILE;
-                    if (!s_splice_linked(c)) kill_conn(c);
-                } else if (c->keep_alive) {
-                    reset_conn(c);
-                    if (!s_recv_to(c)) kill_conn(c);
-                } else {
-                    kill_conn(c);
-                }
-                continue;
+        case Server::State::OPENING_FILE: {
+            if (res < 0) {
+                c->state = Server::State::SENDING_HEADERS;
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_send(s, c->fd, c->response_data.data(),
+                                       c->response_data.size(), MSG_NOSIGNAL);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
+                break;
             }
+            c->file_fd = res;
+            file_ops::lock_shared_nb(c->file_fd);
+            if (::pipe2(c->splice_pipe, O_NONBLOCK) < 0) { kill_conn(c); break; }
+            ::fcntl(c->splice_pipe[0], F_SETPIPE_SZ, PIPE_CAPACITY);
+            ::fcntl(c->splice_pipe[1], F_SETPIPE_SZ, PIPE_CAPACITY);
+            c->state = Server::State::SENDING_HEADERS;
+            struct io_uring_sqe* s = sqe();
+            if (s) {
+                io_uring_prep_send(s, c->fd, c->response_data.data(),
+                                   c->response_data.size(), MSG_NOSIGNAL);
+                io_uring_sqe_set_data(s, c);
+            } else kill_conn(c);
+            break;
+        }
 
-            case State::SENDING_FILE: {
-                if (res <= 0) { kill_conn(c); continue; }
+        case Server::State::RECEIVING_BODY: {
+            if (c->put_write_pending) {
+                c->put_write_pending = false;
+                if (res < 0) { cleanup_rb(c); break; }
+                if (static_cast<size_t>(res) < c->put_write_size) {
+                    size_t wrote = static_cast<size_t>(res);
+                    c->body_received -= (c->put_write_size - wrote);
+                    size_t r = c->put_write_size - wrote;
+                    memmove(c->read_buf, c->read_buf + wrote, r);
+                    c->put_write_size = r; c->put_write_pending = true;
+                    struct io_uring_sqe* s = sqe();
+                    if (s) { io_uring_prep_write(s, c->output_fd, c->read_buf, c->put_write_size, -1); io_uring_sqe_set_data(s, c); }
+                    else cleanup_rb(c);
+                    break;
+                }
+                if (c->body_received >= c->body_expected) {
+                    uring_async_close(c->output_fd); c->output_fd = -1;
+                    if (!c->output_tmp_path.empty() && !c->output_final_path.empty())
+                        ::rename(c->output_tmp_path.c_str(), c->output_final_path.c_str());
+                    c->output_tmp_path.clear(); c->output_final_path.clear();
+                    c->response_data = build_response_string(c->existed_before_put ? 200 : 201, c->keep_alive);
+                    c->state = Server::State::SENDING_HEADERS;
+                    struct io_uring_sqe* s = sqe();
+                    if (s) { io_uring_prep_send(s, c->fd, c->response_data.data(), c->response_data.size(), MSG_NOSIGNAL); io_uring_sqe_set_data(s, c); }
+                    else kill_conn(c);
+                    break;
+                }
+                c->read_offset = 0;
+                {
+                    struct io_uring_sqe* s = sqe();
+                    if (s) { io_uring_prep_recv(s, c->fd, c->read_buf, BUF_SIZE, 0); io_uring_sqe_set_data(s, c); }
+                    else cleanup_rb(c);
+                }
+                break;
+            }
+            if (res <= 0) { cleanup_rb(c); break; }
+            c->put_write_size = static_cast<size_t>(res);
+            c->put_write_pending = true;
+            c->body_received += static_cast<size_t>(res);
+            {
+                struct io_uring_sqe* s = sqe();
+                if (s) { io_uring_prep_write(s, c->output_fd, c->read_buf, c->put_write_size, -1); io_uring_sqe_set_data(s, c); }
+                else cleanup_rb(c);
+            }
+            break;
+        }
+
+        case Server::State::SENDING_HEADERS: {
+            if (res <= 0) { kill_conn(c); break; }
+            c->send_offset += static_cast<size_t>(res);
+            if (c->send_offset < c->response_data.size()) {
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    size_t len = c->response_data.size() - c->send_offset;
+                    io_uring_prep_send(s, c->fd, c->response_data.data() + c->send_offset, len, MSG_NOSIGNAL);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
+                break;
+            }
+            if (c->file_fd >= 0 && c->file_remaining > 0) {
+                c->state = Server::State::SENDING_FILE;
+                c->splice_phase = Server::SplicePhase::TO_PIPE;
+                size_t chunk = c->file_remaining;
+                if (chunk > PIPE_CAPACITY) chunk = PIPE_CAPACITY;
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_splice(s, c->file_fd, c->file_off,
+                                         c->splice_pipe[1], -1, static_cast<unsigned>(chunk),
+                                         SPLICE_F_MOVE | SPLICE_F_MORE);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
+            } else if (c->keep_alive) {
+                reset_conn(c);
+                struct io_uring_sqe* s = sqe();
+                if (s) { io_uring_prep_recv(s, c->fd, c->read_buf, BUF_SIZE, 0); io_uring_sqe_set_data(s, c); }
+                else kill_conn(c);
+            } else { kill_conn(c); }
+            break;
+        }
+
+        case Server::State::SENDING_FILE: {
+            if (res <= 0) { kill_conn(c); break; }
+            if (c->splice_phase == Server::SplicePhase::TO_PIPE) {
+                c->splice_pending = static_cast<size_t>(res);
+                c->splice_phase = Server::SplicePhase::TO_SOCKET;
+                struct io_uring_sqe* s = sqe();
+                if (s) {
+                    io_uring_prep_splice(s, c->splice_pipe[0], -1, c->fd, -1,
+                                         static_cast<unsigned>(c->splice_pending),
+                                         SPLICE_F_MOVE | SPLICE_F_MORE);
+                    io_uring_sqe_set_data(s, c);
+                } else kill_conn(c);
+            } else {
                 size_t sent = static_cast<size_t>(res);
                 if (sent < c->splice_pending) {
                     c->splice_pending -= sent;
-                    if (!s_splice_sock(c)) kill_conn(c);
+                    struct io_uring_sqe* s = sqe();
+                    if (s) {
+                        io_uring_prep_splice(s, c->splice_pipe[0], -1, c->fd, -1,
+                                             static_cast<unsigned>(c->splice_pending),
+                                             SPLICE_F_MOVE | SPLICE_F_MORE);
+                        io_uring_sqe_set_data(s, c);
+                    } else kill_conn(c);
                 } else {
                     c->file_off += static_cast<off_t>(c->splice_pending);
                     c->file_remaining -= c->splice_pending;
                     c->splice_pending = 0;
                     if (c->file_remaining > 0) {
-                        if (!s_splice_linked(c)) kill_conn(c);
+                        c->splice_phase = Server::SplicePhase::TO_PIPE;
+                        size_t chunk = c->file_remaining;
+                        if (chunk > PIPE_CAPACITY) chunk = PIPE_CAPACITY;
+                        struct io_uring_sqe* s = sqe();
+                        if (s) {
+                            io_uring_prep_splice(s, c->file_fd, c->file_off,
+                                                 c->splice_pipe[1], -1, static_cast<unsigned>(chunk),
+                                                 SPLICE_F_MOVE | SPLICE_F_MORE);
+                            io_uring_sqe_set_data(s, c);
+                        } else kill_conn(c);
                     } else {
                         uring_async_close(c->file_fd); c->file_fd = -1;
                         uring_async_close(c->splice_pipe[0]); c->splice_pipe[0] = -1;
                         uring_async_close(c->splice_pipe[1]); c->splice_pipe[1] = -1;
                         if (c->keep_alive) {
                             reset_conn(c);
-                            if (!s_recv_to(c)) kill_conn(c);
-                        } else {
-                            kill_conn(c);
-                        }
+                            struct io_uring_sqe* s = sqe();
+                            if (s) { io_uring_prep_recv(s, c->fd, c->read_buf, BUF_SIZE, 0); io_uring_sqe_set_data(s, c); }
+                            else kill_conn(c);
+                        } else kill_conn(c);
                     }
                 }
-                continue;
             }
-
-            case State::CLOSING:
-                kill_conn(c);
-                continue;
-            }
+            break;
         }
-        io_uring_cq_advance(&ring, batch);
+
+        case Server::State::CLOSING:
+            kill_conn(c);
+            break;
+        }
+        }
+
+done_cqe:
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_submit(&ring);
     }
 
     tls_ring = nullptr;
     io_uring_queue_exit(&ring);
 }
 
-// ── Run ─────────────────────────────────────────────────────────────────────
-
 void Server::run() {
+    // Raise FD limit
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
@@ -579,11 +536,11 @@ void Server::run() {
                 rl.rlim_cur = 65536;
                 setrlimit(RLIMIT_NOFILE, &rl);
             }
-            std::cout << "[INFO] FD limit " << rl.rlim_cur
-                      << " → " << (MAX_CONNS_PER_WORKER * num_workers_) << " max conns" << std::endl;
+            std::cout << "[INFO] FD limit " << rl.rlim_cur << std::endl;
         }
     }
 
+    // SO_REUSEPORT per worker
     listen_fds_.reserve(num_workers_);
     for (unsigned i = 0; i < num_workers_; ++i) {
         int fd = create_listen_socket(port_);

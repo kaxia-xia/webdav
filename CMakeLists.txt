@@ -102,6 +102,12 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
         "Install path prefix (default: ~/.local)" FORCE)
 endif()
 
+# ── Install RPATH: keep the custom liburing path after install ──────────────
+set_target_properties(webdav-server PROPERTIES
+    INSTALL_RPATH "/home/kaxia/.local/lib"
+    BUILD_RPATH   "/home/kaxia/.local/lib"
+)
+
 # ── Install ──────────────────────────────────────────────────────────────────
 install(TARGETS webdav-server
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"

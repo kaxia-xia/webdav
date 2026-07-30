@@ -21,8 +21,8 @@ public:
     void shutdown();
     int port() const { return port_; }
 
-    static constexpr size_t PIPE_CAPACITY  = 1048576;  // 1 MiB
-    static constexpr size_t READ_BUF_SIZE  = 16384;    // 16 KiB — HTTP headers fit
+    static constexpr size_t PIPE_CAPACITY  = 1048576;
+    static constexpr size_t READ_BUF_SIZE  = 16384;
 
 private:
     int port_;
@@ -33,36 +33,24 @@ private:
     std::vector<std::jthread> workers_;
 
     enum class State {
-        READING_REQUEST,
-        RECEIVING_BODY,
-        OPENING_FILE,
-        SENDING_HEADERS,
-        SENDING_FILE,
-        CLOSING,
+        READING_REQUEST, RECEIVING_BODY, OPENING_FILE,
+        SENDING_HEADERS, SENDING_FILE, CLOSING,
     };
-
     enum class SplicePhase { TO_PIPE, TO_SOCKET };
-
-    static constexpr unsigned MAX_CONNS_PER_WORKER = 4096;
-    static constexpr unsigned POOL_BLOCK           = 64;   // alloc 64 conns at once
 
     struct Connection {
         int fd = -1;
         State state = State::READING_REQUEST;
         bool keep_alive = true;
+        bool recv_has_timeout = false;
 
-        // ── Parsing (16 KiB stack buffer) ───────────────────────────────
         http::Parser parser;
         char read_buf[READ_BUF_SIZE];
         size_t read_offset = 0;
-        bool recv_has_timeout = false;  // linked timeout armed on recv
 
-        // ── Response ────────────────────────────────────────────────────
         std::string response_data;
         size_t send_offset = 0;
-        bool send_is_zc = false;  // true if current send was via send_zc
 
-        // ── File serving (zero-copy splice) ─────────────────────────────
         int file_fd = -1;
         std::string file_path;
         off_t file_off = 0;
@@ -71,7 +59,6 @@ private:
         SplicePhase splice_phase = SplicePhase::TO_PIPE;
         size_t splice_pending = 0;
 
-        // ── File receiving ──────────────────────────────────────────────
         int output_fd = -1;
         std::string output_final_path;
         std::string output_tmp_path;
@@ -80,9 +67,6 @@ private:
         bool existed_before_put = false;
         bool put_write_pending = false;
         size_t put_write_size = 0;
-
-        // ── Free list (for object pool) ─────────────────────────────────
-        Connection* pool_next = nullptr;
     };
 
     void worker_loop(unsigned worker_id, int listen_fd);
