@@ -85,11 +85,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wall -Wextra -Wpedantic
         -mcpu=cortex-a55
         -flto=auto
+        -fno-semantic-interposition
     )
     target_compile_options(webdav-server PRIVATE
         -Wall -Wextra -Wpedantic
         -mcpu=cortex-a55
         -flto=auto
+        -fno-semantic-interposition
     )
     target_link_options(webdav-server PRIVATE -flto=auto)
 endif()

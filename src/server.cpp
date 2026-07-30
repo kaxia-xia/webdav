@@ -85,6 +85,23 @@ void Server::shutdown() {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// Thread-local ring pointer so close_connection/reset_connection can use
+// io_uring async close (IORING_OP_CLOSE + SKIP_SUCCESS) instead of sync ::close.
+// Set at worker_loop entry, cleared on exit.
+static thread_local struct io_uring* tls_ring = nullptr;
+
+// Submit an async close — fire and forget (no CQE).  The kernel holds a
+// reference to the file until the close completes, so the fd number can be
+// reused immediately without risk.
+static void uring_async_close(int fd) {
+    if (fd < 0 || !tls_ring) { if (fd >= 0) ::close(fd); return; }
+    struct io_uring_sqe* sqe = io_uring_get_sqe(tls_ring);
+    if (!sqe) { ::close(fd); return; }          // ring full → fallback sync
+    io_uring_prep_close(sqe, fd);
+    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;        // no CQE, no cleanup needed
+    // No io_uring_sqe_set_data — nothing references Connection memory.
+}
+
 void Server::set_socket_options(int fd) {
     struct timeval tv{30, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -93,11 +110,11 @@ void Server::set_socket_options(int fd) {
 }
 
 void Server::close_connection(Connection* conn) {
-    if (conn->fd >= 0)         { ::close(conn->fd); conn->fd = -1; }
-    if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
-    if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
-    if (conn->splice_pipe[0] >= 0) { ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1; }
-    if (conn->splice_pipe[1] >= 0) { ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1; }
+    uring_async_close(conn->fd);         conn->fd = -1;
+    uring_async_close(conn->file_fd);    conn->file_fd = -1;
+    uring_async_close(conn->output_fd);  conn->output_fd = -1;
+    uring_async_close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
+    uring_async_close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
     // Clean up incomplete upload temp file
     if (!conn->output_tmp_path.empty()) {
         ::unlink(conn->output_tmp_path.c_str());
@@ -113,13 +130,13 @@ void Server::reset_connection(Connection* conn) {
     conn->response_data.clear();
     conn->send_offset = 0;
     conn->keep_alive = true;
-    if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
-    if (conn->splice_pipe[0] >= 0) { ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1; }
-    if (conn->splice_pipe[1] >= 0) { ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1; }
+    uring_async_close(conn->file_fd);    conn->file_fd = -1;
+    uring_async_close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
+    uring_async_close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
     conn->file_remaining = 0;
     conn->splice_pending = 0;
     conn->splice_phase = SplicePhase::TO_PIPE;
-    if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
+    uring_async_close(conn->output_fd);  conn->output_fd = -1;
     conn->body_expected = 0;
     conn->body_received = 0;
     conn->put_write_pending = false;
@@ -167,6 +184,7 @@ void Server::worker_loop() {
                    IORING_SETUP_DEFER_TASKRUN;
 
     int ret = io_uring_queue_init_params(RING_ENTRIES, &ring, &params);
+    tls_ring = &ring;  // enable async close for this worker
     if (ret < 0) {
         std::cerr << "[ERROR] io_uring init: " << std::strerror(-ret) << std::endl;
         return;
@@ -250,6 +268,7 @@ void Server::worker_loop() {
     // ── Kick off multishot accept (one SQE, re-arms automatically) ───────
     if (!uring_multishot_accept()) {
         std::cerr << "[ERROR] multishot accept failed" << std::endl;
+        tls_ring = nullptr;
         io_uring_queue_exit(&ring);
         return;
     }
@@ -403,7 +422,7 @@ void Server::worker_loop() {
                     // ── Async write completion ─────────────────────────
                     conn->put_write_pending = false;
                     if (res < 0) {
-                        if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                        uring_async_close(conn->output_fd); conn->output_fd = -1;
                         if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                         close_connection(conn);
                         break;
@@ -419,7 +438,7 @@ void Server::worker_loop() {
                         break;
                     }
                     if (conn->body_received >= conn->body_expected) {
-                        ::close(conn->output_fd); conn->output_fd = -1;
+                        uring_async_close(conn->output_fd); conn->output_fd = -1;
                         if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
                             ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
                         }
@@ -438,7 +457,7 @@ void Server::worker_loop() {
                 }
 
                 if (res <= 0) {
-                    if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                    uring_async_close(conn->output_fd); conn->output_fd = -1;
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
                     break;
@@ -449,7 +468,7 @@ void Server::worker_loop() {
                 conn->body_received += static_cast<size_t>(res);
 
                 if (!uring_write_body(conn)) {
-                    if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                    uring_async_close(conn->output_fd); conn->output_fd = -1;
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
                 }
@@ -506,9 +525,9 @@ void Server::worker_loop() {
                             conn->splice_phase = SplicePhase::TO_PIPE;
                             if (!uring_splice_to_pipe(conn)) close_connection(conn);
                         } else {
-                            ::close(conn->file_fd); conn->file_fd = -1;
-                            ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
-                            ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
+                            uring_async_close(conn->file_fd); conn->file_fd = -1;
+                            uring_async_close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
+                            uring_async_close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
                             if (conn->keep_alive) {
                                 reset_connection(conn);
                                 if (!uring_recv(conn)) close_connection(conn);
@@ -535,6 +554,7 @@ void Server::worker_loop() {
         io_uring_submit(&ring);
     }
 
+    tls_ring = nullptr;
     io_uring_queue_exit(&ring);
 }
 
