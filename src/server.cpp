@@ -376,9 +376,7 @@ void Server::worker_loop() {
                             if (!uring_send(conn)) close_connection(conn);
                             break;
                         }
-                        // Non-blocking shared lock: if busy, serve anyway.
-                        // We never block the io_uring thread on advisory locks.
-                        file_ops::lock_shared_nb(conn->file_fd);
+                        file_ops::lock_shared(conn->file_fd);
                         conn->file_off = resp.file_offset;
                         conn->file_remaining = resp.content_length_opt().value_or(0);
 
