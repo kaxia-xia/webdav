@@ -26,23 +26,16 @@ private:
     std::optional<std::string> password_;
 
     // Check HTTP Basic auth; returns true if authorized (or auth not configured)
-    // resolved_path is used to verify media tokens embedded in query string
     bool check_auth(const http::Request& req, const fs::path& resolved_path);
-
-    // Check if the request is from a browser (Accept: text/html)
 
     // Generate a short-lived token for unauthenticated media access
     [[nodiscard]] std::string generate_media_token(const fs::path& filepath) const;
 
     // Verify a media token is valid for the given file
     [[nodiscard]] bool verify_media_token(const fs::path& filepath, std::string_view token) const;
+
     static bool is_browser_request(const http::Request& req);
-
-    // Check if Accept header prefers text/html (page navigation vs media request)
     static bool prefers_html(const http::Request& req);
-
-    // Check if file is a video or audio file (by extension)
-    static bool is_media_file(const fs::path& path);
 
     // Serve an HTML5 media player page for video/audio files
     http::Response serve_media_player_page(const http::Request& req, const fs::path& resolved);
@@ -66,6 +59,9 @@ private:
     void add_common_headers(http::Response& resp);
     void add_dav_header(http::Response& resp);
 
-    // Generate error response
+    // Add security-related headers to HTML responses
+    static void add_security_headers(http::Response& resp);
+
+    // Generate error response (message is HTML-escaped now)
     http::Response error_response(int code, std::string_view message = {});
 };

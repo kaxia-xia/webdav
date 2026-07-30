@@ -34,11 +34,9 @@ std::optional<ByteRange> Request::parse_range(std::optional<uintmax_t> file_size
     if (!h) return std::nullopt;
 
     std::string_view v = *h;
-    // Must be "bytes="
     if (v.size() < 6 || !utils::iequals(v.substr(0, 6), "bytes=")) return std::nullopt;
 
     std::string_view range_val = v.substr(6);
-    // Only handle first range if multiple ("bytes=0-1023,2048-4095")
     auto comma = range_val.find(',');
     if (comma != std::string_view::npos) range_val = range_val.substr(0, comma);
 
@@ -51,33 +49,26 @@ std::optional<ByteRange> Request::parse_range(std::optional<uintmax_t> file_size
     ByteRange br;
 
     if (start_str.empty()) {
-        // Suffix range: "bytes=-500" → last 500 bytes
         if (!file_size || *file_size == 0) return std::nullopt;
-
         size_t suffix_count = 0;
         auto res = std::from_chars(end_str.data(), end_str.data() + end_str.size(), suffix_count);
         if (res.ec != std::errc{}) return std::nullopt;
         if (suffix_count == 0) return std::nullopt;
-
         if (suffix_count > *file_size) suffix_count = static_cast<size_t>(*file_size);
         br.start = static_cast<size_t>(*file_size - suffix_count);
         br.end   = static_cast<size_t>(*file_size - 1);
     } else {
         auto res = std::from_chars(start_str.data(), start_str.data() + start_str.size(), br.start);
         if (res.ec != std::errc{}) return std::nullopt;
-
         if (!end_str.empty()) {
             size_t end = 0;
             auto res2 = std::from_chars(end_str.data(), end_str.data() + end_str.size(), end);
             if (res2.ec != std::errc{}) return std::nullopt;
             br.end = end;
         }
-        // else: br.end == nullopt → from start to EOF
     }
 
-    // Sanity: end must be >= start if specified
     if (br.end && *br.end < br.start) return std::nullopt;
-
     return br;
 }
 
@@ -94,7 +85,7 @@ void Parser::reset() {
     body_received_ = 0;
 }
 
-bool Parser::parse(std::string_view data) {
+bool Parser::parse(std::string_view data, size_t max_body) {
     buffer_.append(data);
 
     while (state_ != State::COMPLETE) {
@@ -140,8 +131,16 @@ bool Parser::parse(std::string_view data) {
                 auto cl = request_.content_length();
                 if (cl.has_value()) {
                     body_expected_ = *cl;
+                    request_.expected_body_size = *cl;
                     if (body_expected_ > 0) {
-                        state_ = State::BODY;
+                        if (body_expected_ > max_body) {
+                            // Body too large — stop here, caller will stream
+                            request_.body_truncated = true;
+                            state_ = State::COMPLETE;
+                            leftover_ = buffer_;
+                        } else {
+                            state_ = State::BODY;
+                        }
                     } else {
                         state_ = State::COMPLETE;
                         leftover_ = buffer_;
@@ -207,23 +206,28 @@ std::optional<size_t> Response::content_length_opt() const {
 std::string Response::to_string() const {
     std::string result;
 
-    // ── Pre-compute exact size to avoid reallocs ──────────────────────────
-    size_t estimate = 20;  // "HTTP/1.1 XXX ...\r\n"
+    // Pre-compute exact size to avoid reallocs
+    size_t estimate = 20;
     for (const auto& h : headers) {
-        estimate += h.name.size() + h.value.size() + 4;  // ": " + "\r\n"
+        estimate += h.name.size() + h.value.size() + 4;
     }
-    estimate += 2;           // trailing "\r\n"
-    estimate += body.size(); // body (empty when using sendfile)
+    estimate += 2;
+
+    // Omit body from serialisation when sending a file or streaming body
+    bool has_separate_body = file_to_send.has_value() || body_output_fd >= 0;
+    if (!has_separate_body) {
+        estimate += body.size();
+    }
     result.reserve(estimate);
 
-    // ── Status line ──────────────────────────────────────────────────────
+    // Status line
     result += "HTTP/1.1 ";
     result += std::to_string(status_code);
     result += " ";
     result += status_text.empty() ? std::string(status_message(status_code)) : status_text;
     result += "\r\n";
 
-    // ── Headers ───────────────────────────────────────────────────────────
+    // Headers
     for (const auto& h : headers) {
         result += h.name;
         result += ": ";
@@ -232,7 +236,11 @@ std::string Response::to_string() const {
     }
 
     result += "\r\n";
-    result += body;
+
+    // Body (only for in-memory responses)
+    if (!has_separate_body) {
+        result += body;
+    }
     return result;
 }
 

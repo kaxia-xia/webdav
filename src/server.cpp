@@ -8,20 +8,27 @@
 #include <cerrno>
 
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <sys/sendfile.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
 
-// ── Constants ────────────────────────────────────────────────────────────────
-static constexpr int MAX_EPOLL_EVENTS = 256;
-static constexpr int EPOLL_TIMEOUT_MS = 1000;
-static constexpr int SOCKET_TIMEOUT_SEC = 30;
+// liburing is a C library with kernel ABI structs that use C idioms
+// (anonymous structs, zero-length arrays, flexible array members).
+// Suppress C++ pedantic warnings for the inclusion.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#include <liburing.h>
+#pragma GCC diagnostic pop
+
+// ── Per-thread constants ─────────────────────────────────────────────────────
+static constexpr unsigned RING_ENTRIES     = 512;
+static constexpr unsigned MAX_ACCEPTS      = 16;
+static constexpr uintptr_t ACCEPT_MARKER   = 1;
+static constexpr size_t   STREAM_THRESHOLD = 65536;
+static constexpr size_t   BUF_SIZE         = 65536;
 
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
@@ -33,273 +40,359 @@ Server::Server(const fs::path& root_dir, int port, bool allow_browser,
     , num_workers_(std::thread::hardware_concurrency())
 {
     if (num_workers_ < 1) num_workers_ = 4;
-    std::cout << "[INFO] Starting with " << num_workers_ << " worker threads" << std::endl;
-
-    // Initialize thumbnail subsystem
+    std::cout << "[INFO] " << num_workers_ << " workers, io_uring backend" << std::endl;
     thumbnail::init();
 }
 
-Server::~Server() {
-    shutdown();
-}
+Server::~Server() { shutdown(); }
 
 void Server::shutdown() {
-    if (!running_.exchange(false)) return;  // already shut down
-
-    // Poke the eventfd so workers wake up from epoll_wait
-    if (shutdown_fd_ >= 0) {
+    if (!running_.exchange(false)) return;
+    if (shutdown_eventfd_ >= 0) {
         uint64_t val = 1;
-        ssize_t n = write(shutdown_fd_, &val, sizeof(val));
-        (void)n; // best effort
+        ssize_t n = write(shutdown_eventfd_, &val, sizeof(val));
+        (void)n;
     }
-
-    // Close server socket to unblock accept
     if (server_fd_ >= 0) {
         ::close(server_fd_);
         server_fd_ = -1;
     }
 }
 
-// ── sendfile helper ──────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-ssize_t Server::send_file_range(int out_fd, const std::string& path, off_t offset, size_t count) {
-    if (count == 0) return 0;
-
-    int file_fd = ::open(path.c_str(), O_RDONLY);
-    if (file_fd < 0) {
-        std::cerr << "[ERROR] Cannot open file for sendfile: " << path << std::endl;
-        return -1;
-    }
-
-    // Acquire shared advisory lock — prevents concurrent PUT/DELETE/MOVE
-    // while the file is being streamed. Released automatically on close().
-    file_ops::lock_shared(file_fd);
-
-    // Tune send buffer for large media files (256 KB)
-    int sndbuf = 256 * 1024;
-    setsockopt(out_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-    off_t cur_off = offset;
-    size_t remaining = count;
-    ssize_t total_sent = 0;
-
-    struct pollfd pfd;
-    pfd.fd = out_fd;
-    pfd.events = POLLOUT;
-
-    while (remaining > 0) {
-        ssize_t n = ::sendfile(out_fd, file_fd, &cur_off, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Wait until socket is writable (100ms timeout)
-                int pr = ::poll(&pfd, 1, 100);
-                if (pr < 0) {
-                    if (errno == EINTR) continue;
-                    ::close(file_fd);
-                    return -1;
-                }
-                if (pr == 0) continue; // timeout, retry sendfile
-                continue;
-            }
-            ::close(file_fd);
-            return -1;
-        }
-        if (n == 0) break;
-        total_sent += n;
-        remaining -= static_cast<size_t>(n);
-    }
-
-    ::close(file_fd);
-    return total_sent;
+void Server::set_socket_options(int fd) {
+    struct timeval tv{30, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int opt = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
-// ── Handle a single client connection (blocking IO, one-shot) ────────────────
-
-void Server::handle_client(int client_fd) {
-    http::Parser parser;
-
-    // ── Socket options ───────────────────────────────────────────────────
-    struct timeval tv;
-    tv.tv_sec = SOCKET_TIMEOUT_SEC;
-    tv.tv_usec = 0;
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    // NOTE: Do NOT set SO_SNDTIMEO — it breaks sendfile() for large files
-
-    int optval = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
-
-    char buf[65536];
-    std::string pending;
-    bool keep_alive = true;
-
-    while (running_ && keep_alive) {
-        // ── Read data ────────────────────────────────────────────────────
-        if (pending.empty()) {
-            ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
-            if (n <= 0) {
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    break; // Timeout — keep-alive idle, close gracefully
-                }
-                break; // connection closed or error
-            }
-            pending.assign(buf, static_cast<size_t>(n));
-        }
-
-        // Parse and handle all complete requests in the buffer
-        while (!pending.empty() && running_) {
-            if (!parser.parse(pending)) {
-                if (parser.needs_more()) {
-                    // Read more data into pending
-                    ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
-                    if (n <= 0) {
-                        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                            goto close_connection; // incomplete request + timeout
-                        }
-                        goto close_connection;
-                    }
-                    pending.append(buf, static_cast<size_t>(n));
-                    continue; // retry parsing with more data
-                }
-                // Parse error — send 400 and close
-                http::Response resp;
-                resp.status_code = 400;
-                resp.set_header("Connection", "close");
-                resp.set_header("Content-Length", "0");
-                std::string resp_str = resp.to_string();
-                ::send(client_fd, resp_str.data(), resp_str.size(), MSG_NOSIGNAL);
-                goto close_connection;
-            }
-
-            // Handle the request
-            const auto& req = parser.request();
-            http::Response resp = handler_.handle(req);
-
-            // Check Connection header
-            keep_alive = true;
-            auto conn = req.header("Connection");
-            if (conn && utils::iequals(*conn, "close")) {
-                keep_alive = false;
-                resp.set_header("Connection", "close");
-            } else {
-                resp.set_header("Connection", "keep-alive");
-            }
-
-            // Build and send response headers + body (if any, in-memory)
-            std::string resp_str = resp.to_string();
-
-            // If there's a file to send, use TCP_CORK to combine headers
-            // and file data into fewer TCP segments (less overhead).
-            if (resp.file_to_send) {
-                int cork = 1;
-                setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-            }
-
-            ssize_t sent = ::send(client_fd, resp_str.data(), resp_str.size(), MSG_NOSIGNAL);
-            if (sent < 0) {
-                goto close_connection;
-            }
-
-            // If response has a file to send, use zero-copy sendfile
-            if (resp.file_to_send) {
-                auto cl = resp.content_length_opt();
-                size_t file_size = cl.value_or(0);
-                ssize_t fsent = send_file_range(client_fd, *resp.file_to_send, resp.file_offset, file_size);
-
-                // Disable TCP_CORK — flush any remaining data
-                int cork = 0;
-                setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-
-                if (fsent < 0) {
-                    goto close_connection;
-                }
-            }
-
-            // Capture leftover (unparsed pipelined data) before resetting parser
-            // leftover() returns a string_view into parser's internal buffer,
-            // so we must copy it before reset() invalidates it.
-            std::string leftover(parser.leftover());
-            parser.reset();
-            pending = std::move(leftover);
-
-            if (!keep_alive) {
-                goto close_connection;
-            }
-        }
-    }
-
-close_connection:
-    ::close(client_fd);
+void Server::close_connection(Connection* conn) {
+    if (conn->fd >= 0)         { ::close(conn->fd); conn->fd = -1; }
+    if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
+    if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
+    delete conn;
 }
 
-// ── Worker thread loop ───────────────────────────────────────────────────────
+void Server::reset_connection(Connection* conn) {
+    conn->state = State::READING_REQUEST;
+    conn->read_offset = 0;
+    conn->parser.reset();
+    conn->response_data.clear();
+    conn->send_offset = 0;
+    conn->keep_alive = true;
+    if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
+    conn->file_remaining = 0;
+    conn->file_data_ready = false;
+    if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
+    conn->body_expected = 0;
+    conn->body_received = 0;
+}
+
+std::string Server::build_response_string(int code, bool keep_alive) {
+    http::Response resp;
+    resp.status_code = code;
+    resp.set_header("Server", "WebDAV-Server/1.2 (C++20)");
+    resp.set_header("Date", utils::rfc1123_now());
+    resp.set_header("Accept-Ranges", "bytes");
+    resp.set_header("Connection", keep_alive ? "keep-alive" : "close");
+    resp.set_content_length(0);
+    return resp.to_string();
+}
+
+// ── io_uring submission macros (inlined to avoid private-access issues) ──────
+//
+// These are defined as lambdas inside worker_loop() to have access to the ring.
+
+// ── Worker thread (io_uring event loop) ──────────────────────────────────────
 
 void Server::worker_loop() {
-    struct epoll_event events[MAX_EPOLL_EVENTS];
+    struct io_uring ring;
+    struct io_uring_params params = {};
+    params.flags = IORING_SETUP_SINGLE_ISSUER;
+
+    int ret = io_uring_queue_init_params(RING_ENTRIES, &ring, &params);
+    if (ret < 0) {
+        std::cerr << "[ERROR] io_uring init: " << std::strerror(-ret) << std::endl;
+        return;
+    }
+
+    // io_uring submission helpers (access ring and Connection private members)
+    auto uring_accept = [&]() -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        io_uring_prep_accept(sqe, server_fd_, nullptr, nullptr, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(ACCEPT_MARKER));
+        return true;
+    };
+
+    auto uring_recv = [&](Connection* conn) -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        size_t space = BUF_SIZE - conn->read_offset;
+        if (space == 0) return false;
+        io_uring_prep_recv(sqe, conn->fd, conn->read_buf + conn->read_offset, space, 0);
+        io_uring_sqe_set_data(sqe, conn);
+        return true;
+    };
+
+    auto uring_send = [&](Connection* conn) -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        size_t len = conn->response_data.size() - conn->send_offset;
+        io_uring_prep_send(sqe, conn->fd,
+                           conn->response_data.data() + conn->send_offset, len, 0);
+        io_uring_sqe_set_data(sqe, conn);
+        return true;
+    };
+
+    auto uring_read_file = [&](Connection* conn) -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        size_t chunk = conn->file_remaining;
+        if (chunk > BUF_SIZE) chunk = BUF_SIZE;
+        io_uring_prep_read(sqe, conn->file_fd, conn->file_buf, chunk, conn->file_off);
+        io_uring_sqe_set_data(sqe, conn);
+        return true;
+    };
+
+    auto uring_send_file_chunk = [&](Connection* conn, size_t len) -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        io_uring_prep_send(sqe, conn->fd, conn->file_buf, len, 0);
+        io_uring_sqe_set_data(sqe, conn);
+        return true;
+    };
+
+    int accept_in_flight = 0;
+    for (unsigned i = 0; i < MAX_ACCEPTS; i++) {
+        if (uring_accept()) accept_in_flight++;
+    }
+    io_uring_submit(&ring);
 
     while (running_) {
-        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EPOLL_EVENTS, EPOLL_TIMEOUT_MS);
-        if (nfds < 0) {
-            if (errno == EINTR) continue;
+        struct io_uring_cqe* cqe;
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            if (ret == -EINTR) continue;
             break;
         }
 
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
+        uintptr_t ud = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+        int res = cqe->res;
 
-            if (fd == server_fd_) {
-                // Accept all pending connections
-                while (true) {
-                    struct sockaddr_in client_addr{};
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = ::accept4(server_fd_,
-                        reinterpret_cast<struct sockaddr*>(&client_addr),
-                        &client_len, SOCK_NONBLOCK);
-                    if (client_fd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        if (!running_) break;
+        // ── Accept completion ─────────────────────────────────────────────
+        if (ud == ACCEPT_MARKER) {
+            accept_in_flight--;
+            if (res >= 0) {
+                int client_fd = res;
+                set_socket_options(client_fd);
+
+                auto* conn = new Connection;
+                conn->fd = client_fd;
+
+                if (!uring_recv(conn)) close_connection(conn);
+            }
+            while (accept_in_flight < static_cast<int>(MAX_ACCEPTS)) {
+                if (!uring_accept()) break;
+                accept_in_flight++;
+            }
+        }
+        // ── Connection I/O completion ─────────────────────────────────────
+        else if (ud != 0) {
+            auto* conn = reinterpret_cast<Connection*>(ud);
+
+            switch (conn->state) {
+
+            // ══════════════════════════════════════════════════════════════
+            case State::READING_REQUEST: {
+                if (res <= 0) { close_connection(conn); break; }
+
+                conn->read_offset += static_cast<size_t>(res);
+                std::string_view data(conn->read_buf, conn->read_offset);
+                bool done = conn->parser.parse(data, STREAM_THRESHOLD);
+
+                if (!done) {
+                    if (conn->read_offset >= BUF_SIZE) { close_connection(conn); break; }
+                    if (!uring_recv(conn)) close_connection(conn);
+                    break;
+                }
+
+                const auto& req = conn->parser.request();
+
+                // ── Streaming PUT ─────────────────────────────────────────
+                if (req.body_truncated && req.method == http::Method::PUT) {
+                    http::Response resp = handler_.handle(req);
+
+                    if (resp.body_output_fd >= 0) {
+                        conn->state = State::RECEIVING_BODY;
+                        conn->output_fd = resp.body_output_fd;
+                        conn->output_final_path = resp.body_output_path;
+                        conn->body_expected = resp.body_expected;
+                        conn->body_received = 0;
+                        conn->existed_before_put = (resp.status_code == 200);
+
+                        std::string_view lv = conn->parser.leftover();
+                        if (!lv.empty()) {
+                            ssize_t w = ::write(conn->output_fd, lv.data(), lv.size());
+                            if (w < 0) { close_connection(conn); break; }
+                            conn->body_received += static_cast<size_t>(w);
+                        }
+
+                        if (conn->body_received >= conn->body_expected) {
+                            ::close(conn->output_fd); conn->output_fd = -1;
+                            conn->response_data = build_response_string(
+                                conn->existed_before_put ? 200 : 201, conn->keep_alive);
+                            conn->send_offset = 0;
+                            conn->state = State::SENDING_HEADERS;
+                            if (!uring_send(conn)) close_connection(conn);
+                            break;
+                        }
+
+                        conn->read_offset = 0;
+                        if (!uring_recv(conn)) close_connection(conn);
                         break;
                     }
 
-                    char client_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-                    std::cout << "[CONNECT] " << client_ip << ":"
-                              << ntohs(client_addr.sin_port) << std::endl;
+                    // Fall through: no streaming, use response directly
+                    conn->state = State::SENDING_HEADERS;
+                    conn->response_data = resp.to_string();
+                    conn->send_offset = 0;
+                    auto ch = req.header("Connection");
+                    if (ch && utils::iequals(*ch, "close")) conn->keep_alive = false;
+                    if (!uring_send(conn)) close_connection(conn);
+                    break;
+                }
 
-                    // Register client fd with one-shot
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN | EPOLLONESHOT | EPOLLRDHUP;
-                    ev.data.fd = client_fd;
-                    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-                        std::cerr << "[WARN] epoll_ctl add client failed: "
-                                  << std::strerror(errno) << std::endl;
-                        ::close(client_fd);
+                // ── Normal request ────────────────────────────────────────
+                {
+                    http::Response resp = handler_.handle(req);
+                    auto ch = req.header("Connection");
+                    if (ch && utils::iequals(*ch, "close")) {
+                        conn->keep_alive = false;
+                        resp.set_header("Connection", "close");
+                    } else {
+                        resp.set_header("Connection", "keep-alive");
+                    }
+
+                    conn->response_data = resp.to_string();
+                    conn->send_offset = 0;
+
+                    if (resp.file_to_send) {
+                        conn->file_fd = ::open(resp.file_to_send->c_str(), O_RDONLY);
+                        if (conn->file_fd < 0) { close_connection(conn); break; }
+                        file_ops::lock_shared(conn->file_fd);
+                        conn->file_off = resp.file_offset;
+                        conn->file_remaining = resp.content_length_opt().value_or(0);
+                        conn->file_data_ready = false;
+                    }
+
+                    conn->state = State::SENDING_HEADERS;
+                    if (!uring_send(conn)) close_connection(conn);
+                }
+                break;
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            case State::RECEIVING_BODY: {
+                if (res <= 0) {
+                    if (conn->output_fd >= 0) ::close(conn->output_fd);
+                    conn->output_fd = -1;
+                    close_connection(conn);
+                    break;
+                }
+
+                ssize_t w = ::write(conn->output_fd, conn->read_buf, static_cast<size_t>(res));
+                if (w < 0) {
+                    if (conn->output_fd >= 0) ::close(conn->output_fd);
+                    conn->output_fd = -1;
+                    close_connection(conn);
+                    break;
+                }
+                conn->body_received += static_cast<size_t>(w);
+
+                if (conn->body_received >= conn->body_expected) {
+                    ::close(conn->output_fd); conn->output_fd = -1;
+                    conn->response_data = build_response_string(
+                        conn->existed_before_put ? 200 : 201, conn->keep_alive);
+                    conn->send_offset = 0;
+                    conn->state = State::SENDING_HEADERS;
+                    if (!uring_send(conn)) close_connection(conn);
+                    break;
+                }
+                if (!uring_recv(conn)) close_connection(conn);
+                break;
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            case State::SENDING_HEADERS: {
+                if (res <= 0) { close_connection(conn); break; }
+
+                conn->send_offset += static_cast<size_t>(res);
+                if (conn->send_offset < conn->response_data.size()) {
+                    if (!uring_send(conn)) close_connection(conn);
+                    break;
+                }
+
+                if (conn->file_fd >= 0 && conn->file_remaining > 0) {
+                    conn->state = State::SENDING_FILE;
+                    if (!uring_read_file(conn)) close_connection(conn);
+                } else if (conn->keep_alive) {
+                    reset_connection(conn);
+                    if (!uring_recv(conn)) close_connection(conn);
+                } else {
+                    close_connection(conn);
+                }
+                break;
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            case State::SENDING_FILE: {
+                if (res <= 0) { close_connection(conn); break; }
+
+                if (!conn->file_data_ready) {
+                    size_t bytes = static_cast<size_t>(res);
+                    conn->file_off += static_cast<off_t>(bytes);
+                    conn->file_remaining -= bytes;
+                    conn->file_data_ready = true;
+                    if (!uring_send_file_chunk(conn, bytes)) close_connection(conn);
+                } else {
+                    conn->file_data_ready = false;
+                    if (conn->file_remaining > 0) {
+                        if (!uring_read_file(conn)) close_connection(conn);
+                    } else {
+                        ::close(conn->file_fd); conn->file_fd = -1;
+                        if (conn->keep_alive) {
+                            reset_connection(conn);
+                            if (!uring_recv(conn)) close_connection(conn);
+                        } else {
+                            close_connection(conn);
+                        }
                     }
                 }
-            } else if (fd == shutdown_fd_) {
-                // Drain eventfd
-                uint64_t val;
-                ssize_t n = ::read(shutdown_fd_, &val, sizeof(val));
-                (void)n;
-            } else {
-                // Client fd — set to blocking mode for handle_client
-                int flags = ::fcntl(fd, F_GETFL, 0);
-                if (flags >= 0) {
-                    ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-                }
-                handle_client(fd);
+                break;
+            }
+
+            case State::CLOSING:
+                close_connection(conn);
+                break;
             }
         }
+
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_submit(&ring);
     }
+
+    io_uring_queue_exit(&ring);
 }
 
 // ── Run server ───────────────────────────────────────────────────────────────
 
 void Server::run() {
-    // ── Create server socket ──────────────────────────────────────────────
     server_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd_ < 0) {
-        std::cerr << "[ERROR] Failed to create socket: " << std::strerror(errno) << std::endl;
+        std::cerr << "[ERROR] socket: " << std::strerror(errno) << std::endl;
         return;
     }
 
@@ -313,89 +406,30 @@ void Server::run() {
     addr.sin_port = htons(static_cast<uint16_t>(port_));
 
     if (::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        std::cerr << "[ERROR] Failed to bind port " << port_ << ": "
-                  << std::strerror(errno) << std::endl;
-        ::close(server_fd_);
-        server_fd_ = -1;
-        return;
+        std::cerr << "[ERROR] bind: " << std::strerror(errno) << std::endl;
+        ::close(server_fd_); server_fd_ = -1; return;
     }
-
     if (::listen(server_fd_, SOMAXCONN) < 0) {
-        std::cerr << "[ERROR] Failed to listen: " << std::strerror(errno) << std::endl;
-        ::close(server_fd_);
-        server_fd_ = -1;
-        return;
+        std::cerr << "[ERROR] listen: " << std::strerror(errno) << std::endl;
+        ::close(server_fd_); server_fd_ = -1; return;
     }
 
-    // ── Create epoll ──────────────────────────────────────────────────────
-    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ < 0) {
-        std::cerr << "[ERROR] Failed to create epoll: " << std::strerror(errno) << std::endl;
-        ::close(server_fd_);
-        server_fd_ = -1;
-        return;
-    }
+    shutdown_eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
-    // ── Create shutdown eventfd ───────────────────────────────────────────
-    shutdown_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (shutdown_fd_ < 0) {
-        std::cerr << "[ERROR] Failed to create eventfd: " << std::strerror(errno) << std::endl;
-        ::close(epoll_fd_);
-        ::close(server_fd_);
-        epoll_fd_ = -1;
-        server_fd_ = -1;
-        return;
-    }
+    std::cout << "[INFO] http://0.0.0.0:" << port_ << " — " << handler_.root_dir() << std::endl;
+    std::cout << "[INFO] I/O: io_uring (kernel 6.6, liburing 2.1)" << std::endl;
 
-    // Register shutdown fd
-    {
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = shutdown_fd_;
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, shutdown_fd_, &ev);
-    }
-
-    // Register server fd with EPOLLEXCLUSIVE to avoid thundering herd
-    {
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLEXCLUSIVE;
-        ev.data.fd = server_fd_;
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) < 0) {
-            // EPOLLEXCLUSIVE not supported? fall back
-            ev.events = EPOLLIN;
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev);
-        }
-    }
-
-    std::cout << "[INFO] WebDAV server listening on http://0.0.0.0:" << port_ << std::endl;
-    std::cout << "[INFO] Serving: " << handler_.root_dir() << std::endl;
-    std::cout << "[INFO] Browser access: http://localhost:" << port_ << "/" << std::endl;
-
-    // ── Spawn worker threads ──────────────────────────────────────────────
     workers_.reserve(num_workers_);
     for (unsigned i = 0; i < num_workers_; ++i) {
         workers_.emplace_back(&Server::worker_loop, this);
     }
-
-    // Main thread waits for workers (or signal)
     for (auto& t : workers_) {
         if (t.joinable()) t.join();
     }
     workers_.clear();
 
-    // ── Cleanup ───────────────────────────────────────────────────────────
-    if (shutdown_fd_ >= 0) {
-        ::close(shutdown_fd_);
-        shutdown_fd_ = -1;
-    }
-    if (epoll_fd_ >= 0) {
-        ::close(epoll_fd_);
-        epoll_fd_ = -1;
-    }
-    if (server_fd_ >= 0) {
-        ::close(server_fd_);
-        server_fd_ = -1;
-    }
+    if (shutdown_eventfd_ >= 0) { ::close(shutdown_eventfd_); shutdown_eventfd_ = -1; }
+    if (server_fd_ >= 0)        { ::close(server_fd_); server_fd_ = -1; }
 
     std::cout << "[INFO] Server stopped." << std::endl;
 }

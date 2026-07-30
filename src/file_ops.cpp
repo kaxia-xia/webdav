@@ -38,6 +38,39 @@ fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
     return resolved;
 }
 
+bool is_safe_path(const fs::path& root_dir, const fs::path& resolved) {
+    // Canonicalise both paths — resolves symlinks and ".."
+    std::error_code ec;
+    fs::path real_root = fs::canonical(root_dir, ec);
+    if (ec) return false;
+
+    // The resolved path may not exist yet (e.g. PUT to a new file).
+    // Walk up until we find an existing ancestor, canonicalise that,
+    // then append the non-existent tail.
+    fs::path real_resolved;
+    fs::path tail;
+    fs::path current = resolved;
+
+    while (!fs::exists(current, ec) && current.has_parent_path()) {
+        tail = current.filename() / tail;
+        current = current.parent_path();
+    }
+
+    current = fs::canonical(current, ec);
+    if (ec) return false;
+
+    real_resolved = current / tail;
+    real_resolved = real_resolved.lexically_normal();
+
+    std::string root_s = real_root.string();
+    std::string resolved_s = real_resolved.string();
+
+    if (!root_s.empty() && root_s.back() != '/') root_s += '/';
+    if (!resolved_s.empty() && resolved_s.back() != '/') resolved_s += '/';
+
+    return resolved_s.starts_with(root_s);
+}
+
 bool exists(const fs::path& p) {
     std::error_code ec;
     return fs::exists(p, ec);
@@ -67,30 +100,24 @@ std::chrono::system_clock::time_point last_modified(const fs::path& p) {
 
 std::vector<DirEntry> list_directory(const fs::path& p) {
     std::vector<DirEntry> entries;
-    entries.reserve(64);  // avoid reallocs for typical directories
+    entries.reserve(64);
     std::error_code ec;
 
     for (const auto& entry : fs::directory_iterator(p, ec)) {
         DirEntry de;
         de.name = entry.path().filename().string();
-
-        // Use the directory_entry's cached type (from readdir d_type on Linux)
-        // to avoid a separate stat syscall for is_directory.
-        // fs::is_directory on a directory_entry uses the cached status.
         de.is_directory = entry.is_directory(ec);
         if (de.is_directory) {
             de.size = 0;
         } else {
             de.size = entry.file_size(ec);
         }
-
         auto ftime = entry.last_write_time(ec);
         de.last_modified = std::chrono::file_clock::to_sys(ftime);
         de.creation_time = de.last_modified;
         entries.push_back(std::move(de));
     }
 
-    // Sort: directories first, then alphabetical
     std::sort(entries.begin(), entries.end(), [](const DirEntry& a, const DirEntry& b) {
         if (a.is_directory != b.is_directory) return a.is_directory;
         return a.name < b.name;
@@ -165,17 +192,15 @@ DirEntry get_entry(const fs::path& p) {
 
 int try_lock_exclusive(const fs::path& p) {
     int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0) return -2;  // file doesn't exist or can't open
+    if (fd < 0) return -2;
 
-    // LOCK_EX | LOCK_NB: try exclusive lock without blocking
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
         ::close(fd);
         if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            return -1;  // file is in use (shared lock held by reader)
+            return -1;
         }
-        return -2;  // other error
+        return -2;
     }
-    // Lock acquired — caller MUST close(fd) to release
     return fd;
 }
 

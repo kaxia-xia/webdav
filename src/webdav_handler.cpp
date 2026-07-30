@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <charconv>
 #include <unistd.h>
+#include <fcntl.h>
+
+// Threshold: bodies larger than this are streamed to disk instead of buffered
+static constexpr size_t STREAMING_PUT_THRESHOLD = 65536;  // 64 KiB
 
 WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
                              std::optional<std::string> username,
@@ -26,17 +30,32 @@ WebDavHandler::WebDavHandler(const fs::path& root_dir, bool allow_browser,
     }
 }
 
+// ── HTML escape helper ───────────────────────────────────────────────────────
+
+static std::string escape_html(std::string_view s) {
+    std::string result;
+    result.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '&': result += "&amp;"; break;
+        case '<': result += "&lt;"; break;
+        case '>': result += "&gt;"; break;
+        case '"': result += "&quot;"; break;
+        default:  result.push_back(c); break;
+        }
+    }
+    return result;
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
 bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolved_path) {
-    // No credentials configured → skip auth
     if (!username_ || !password_) return true;
 
     // ── Media token check (for player page subresource requests) ─────────
-    // Browsers' <video>/<audio> elements don't reliably send HTTP Basic auth
-    // credentials on subresource requests. The player page embeds a temporary
-    // token in the media URL so the file can be accessed without auth.
     auto token_start = req.query.find("mtoken=");
     if (token_start != std::string::npos) {
-        std::string token = req.query.substr(token_start + 7); // len("mtoken=")
+        std::string token = req.query.substr(token_start + 7);
         auto amp = token.find('&');
         if (amp != std::string::npos) token.resize(amp);
         if (!token.empty() && verify_media_token(resolved_path, token)) {
@@ -50,30 +69,23 @@ bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolve
 
     std::string_view auth = *auth_hdr;
     if (auth.size() < 6 || !utils::iequals(auth.substr(0, 6), "Basic ")) {
-        std::cerr << "[AUTH] Bad auth header: '" << auth << "'" << std::endl;
         return false;
     }
 
     std::string decoded = utils::base64_decode(auth.substr(6));
     auto colon = decoded.find(':');
-    if (colon == std::string::npos) {
-        std::cerr << "[AUTH] base64 decoded no colon: '" << decoded << "'" << std::endl;
-        return false;
-    }
+    if (colon == std::string::npos) return false;
 
     std::string user = decoded.substr(0, colon);
     std::string pass = decoded.substr(colon + 1);
 
-    bool ok = (user == *username_ && pass == *password_);
-    if (!ok) {
-        std::cerr << "[AUTH] Credential mismatch: got '" << user << "'/'" << pass
-                  << "' expected '" << *username_ << "'/'" << *password_ << "'" << std::endl;
-    }
-    return ok;
+    return (user == *username_ && pass == *password_);
 }
 
+// ── Headers ──────────────────────────────────────────────────────────────────
+
 void WebDavHandler::add_common_headers(http::Response& resp) {
-    resp.set_header("Server", "WebDAV-Server/1.1 (C++20)");
+    resp.set_header("Server", "WebDAV-Server/1.2 (C++20)");
     resp.set_header("Date", utils::rfc1123_now());
     resp.set_header("Accept-Ranges", "bytes");
 }
@@ -84,6 +96,14 @@ void WebDavHandler::add_dav_header(http::Response& resp) {
         "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, PROPPATCH, MOVE, COPY, LOCK, UNLOCK");
 }
 
+void WebDavHandler::add_security_headers(http::Response& resp) {
+    resp.set_header("X-Content-Type-Options", "nosniff");
+    resp.set_header("X-Frame-Options", "DENY");
+    resp.set_header("Referrer-Policy", "no-referrer");
+}
+
+// ── Error response (message is HTML-escaped to prevent XSS) ──────────────────
+
 http::Response WebDavHandler::error_response(int code, std::string_view message) {
     http::Response resp;
     resp.status_code = code;
@@ -91,17 +111,27 @@ http::Response WebDavHandler::error_response(int code, std::string_view message)
 
     std::string msg(message);
     if (msg.empty()) msg = http::status_message(code);
+    std::string safe_msg = escape_html(msg);
 
-    std::string body = "<!DOCTYPE html><html><head><title>" +
-        std::to_string(code) + " " + msg + "</title></head>" +
-        "<body><h1>" + std::to_string(code) + " " + msg + "</h1>" +
-        "<hr><em>WebDAV Server</em></body></html>";
+    std::string body =
+        "<!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>"
+        "<meta charset=\"UTF-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+        "<title>" + std::to_string(code) + " " + safe_msg + "</title>"
+        "<style>body{font-family:sans-serif;max-width:600px;margin:80px auto;padding:20px;}"
+        "h1{font-weight:400;color:#c0392b;}</style>"
+        "</head>\r\n<body>"
+        "<h1>" + std::to_string(code) + " " + safe_msg + "</h1>"
+        "<hr><em>WebDAV Server</em></body>\r\n</html>";
 
     resp.set_content_type("text/html; charset=utf-8");
     resp.set_content_length(body.size());
+    add_security_headers(resp);
     resp.body = std::move(body);
     return resp;
 }
+
+// ── Browser detection ────────────────────────────────────────────────────────
 
 bool WebDavHandler::is_browser_request(const http::Request& req) {
     auto accept = req.header("Accept");
@@ -129,49 +159,16 @@ bool WebDavHandler::prefers_html(const http::Request& req) {
     return accept->find("text/html") != std::string_view::npos;
 }
 
-bool WebDavHandler::is_media_file(const fs::path& path) {
-    auto ext = path.extension().string();
-    // Convert to lowercase for comparison
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".mp4"  || ext == ".webm" || ext == ".ogv"  ||
-           ext == ".mkv"  || ext == ".avi"  || ext == ".mov"  ||
-           ext == ".mp3"  || ext == ".ogg"  || ext == ".opus" ||
-           ext == ".flac" || ext == ".wav"  || ext == ".aac"  ||
-           ext == ".m4a"  || ext == ".wma";
-}
+// ── Media player page ────────────────────────────────────────────────────────
 
-http::Response WebDavHandler::serve_media_player_page(const http::Request& req, const fs::path& resolved) {
+http::Response WebDavHandler::serve_media_player_page(const http::Request& req,
+                                                       const fs::path& resolved) {
     std::string filename = resolved.filename().string();
-    std::string escaped_name = filename;
-    // Basic HTML escaping for the filename
-    auto escape = [](std::string_view s) -> std::string {
-        std::string r;
-        r.reserve(s.size() + 8);
-        for (char c : s) {
-            switch (c) {
-            case '&': r += "&amp;"; break;
-            case '<': r += "&lt;"; break;
-            case '>': r += "&gt;"; break;
-            case '"': r += "&quot;"; break;
-            default:  r.push_back(c); break;
-            }
-        }
-        return r;
-    };
-    escaped_name = escape(escaped_name);
+    std::string escaped_name = escape_html(filename);
 
-    bool is_audio = !(resolved.extension() == ".mp4" ||
-                      resolved.extension() == ".webm" ||
-                      resolved.extension() == ".ogv" ||
-                      resolved.extension() == ".mkv" ||
-                      resolved.extension() == ".avi" ||
-                      resolved.extension() == ".mov");
+    bool is_audio = !thumbnail::is_video_file(filename);
 
-    // Build the media URL with appropriate query parameter:
-    // - With auth:    include a temporary media token so the browser's <video>
-    //                 element can access the file without sending the
-    //                 Authorization header (which it doesn't reliably do)
-    // - Without auth: simple ?raw=1 to bypass the player page
+    // Build media URL with appropriate query parameter
     std::string media_query;
     if (username_ && password_) {
         std::string token = generate_media_token(resolved);
@@ -179,25 +176,8 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
     } else {
         media_query = "?raw=1";
     }
-    // Simple path encoding: replace spaces and special chars
-    auto url_encode_path = [](std::string_view p) -> std::string {
-        std::string r;
-        r.reserve(p.size() * 3);
-        for (char c : p) {
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                c == '.' || c == '~' || c == '/') {
-                r.push_back(c);
-            } else {
-                char hex[4];
-                snprintf(hex, sizeof(hex), "%%%02X", static_cast<unsigned char>(c));
-                r.append(hex, 3);
-            }
-        }
-        return r;
-    };
-    std::string encoded_path = url_encode_path(req.path);
 
+    std::string encoded_path = utils::url_encode(req.path);
     std::string mime = utils::mime_type(resolved.string());
     uintmax_t fsize = file_ops::file_size(resolved);
 
@@ -247,6 +227,7 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
     http::Response resp;
     resp.status_code = 200;
     add_common_headers(resp);
+    add_security_headers(resp);
     resp.set_content_type("text/html; charset=utf-8");
     resp.set_content_length(html.size());
     resp.body = std::move(html);
@@ -254,11 +235,6 @@ http::Response WebDavHandler::serve_media_player_page(const http::Request& req, 
 }
 
 // ── Media token helpers ──────────────────────────────────────────────────────
-// When HTTP Basic auth is enabled, browser <video>/<audio> elements don't
-// reliably include the Authorization header in subresource requests. To
-// work around this, the player page embeds a short-lived token in the
-// media URL. The token is a djb2 hash of (path + expiry + password) and
-// is valid for 1 hour.
 
 static uint64_t djb2_hash(const std::string& data) {
     uint64_t hash = 5381;
@@ -284,7 +260,6 @@ bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_vie
     auto expiry_sv = token.substr(0, underscore);
     auto hash_sv   = token.substr(underscore + 1);
 
-    // Parse expiry
     int64_t expiry = 0;
     auto res = std::from_chars(expiry_sv.data(), expiry_sv.data() + expiry_sv.size(), expiry);
     if (res.ec != std::errc{}) return false;
@@ -293,12 +268,10 @@ bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_vie
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (now > expiry) return false;
 
-    // Parse expected hash
     uint64_t expected_hash = 0;
     res = std::from_chars(hash_sv.data(), hash_sv.data() + hash_sv.size(), expected_hash);
     if (res.ec != std::errc{}) return false;
 
-    // Recompute hash
     std::string key = filepath.string() + "|" + std::string(expiry_sv) + "|" + password_.value_or("");
     return djb2_hash(key) == expected_hash;
 }
@@ -306,11 +279,10 @@ bool WebDavHandler::verify_media_token(const fs::path& filepath, std::string_vie
 // ── Thumbnail endpoint ───────────────────────────────────────────────────────
 
 http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
-    // Extract the 'path' query parameter
     std::string file_path;
     auto path_start = req.query.find("path=");
     if (path_start != std::string::npos) {
-        file_path = req.query.substr(path_start + 5); // len("path=")
+        file_path = req.query.substr(path_start + 5);
         auto amp = file_path.find('&');
         if (amp != std::string::npos) file_path.resize(amp);
         file_path = utils::url_decode(file_path);
@@ -320,13 +292,11 @@ http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
         return error_response(400, "Bad Request — missing path parameter");
     }
 
-    // Resolve the file path against root_dir
     fs::path resolved = file_ops::resolve_path(root_dir_, file_path);
     if (resolved.empty() || !file_ops::exists(resolved)) {
         return error_response(404, "Not Found");
     }
 
-    // Check auth for the target file (or use media token)
     if (!check_auth(req, resolved)) {
         http::Response resp;
         resp.status_code = 401;
@@ -337,7 +307,6 @@ http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
         return resp;
     }
 
-    // Extract optional size parameter
     int size = 256;
     auto size_start = req.query.find("size=");
     if (size_start != std::string::npos) {
@@ -353,7 +322,6 @@ http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
         }
     }
 
-    // Generate thumbnail
     std::string thumb_data = thumbnail::generate(resolved, size);
     std::string mime(thumbnail::mime_type(thumb_data));
 
@@ -362,48 +330,29 @@ http::Response WebDavHandler::handle_thumbnail(const http::Request& req) {
     add_common_headers(resp);
     resp.set_content_type(mime);
     resp.set_content_length(thumb_data.size());
-    // Cache for 1 hour
     resp.set_header("Cache-Control", "public, max-age=3600");
     resp.body = std::move(thumb_data);
     return resp;
 }
 
-http::Response WebDavHandler::handle(const http::Request& req) {
-    // Log every request for debugging
-    std::cerr << "[REQ] " << req.method_str << " " << req.path
-              << " (Auth: " << (req.header("Authorization").has_value() ? "yes" : "no")
-              << ", UA: ";
-    auto ua = req.header("User-Agent");
-    if (ua) {
-        std::string_view uav = *ua;
-        if (uav.size() > 60) uav = uav.substr(0, 60);
-        std::cerr << uav;
-    }
-    std::cerr << ")" << std::endl;
+// ── Main dispatch ────────────────────────────────────────────────────────────
 
+http::Response WebDavHandler::handle(const http::Request& req) {
     // ── Thumbnail endpoint (before auth check — uses own token/auth logic) ─
     if (req.method == http::Method::GET && req.path == "/__thumb__") {
         return handle_thumbnail(req);
     }
 
-    // ── Resolve path (needed early for token-based auth) ──────────────────
+    // ── Resolve path ──────────────────────────────────────────────────────
     fs::path resolved = file_ops::resolve_path(root_dir_, req.path);
     if (resolved.empty()) {
         return error_response(403, "Forbidden");
     }
 
-    // ── OPTIONS: allow without auth for WebDAV client discovery ───────────
-    // Many WebDAV clients (Windows Explorer, macOS Finder, davfs2) send an
-    // initial OPTIONS request WITHOUT credentials to discover server
-    // capabilities. Returning 401 breaks their discovery flow. Apache and
-    // nginx both allow unauthenticated OPTIONS — it's the standard approach.
     bool is_options = (req.method == http::Method::OPTIONS);
 
     // ── Auth check (skip for OPTIONS) ────────────────────────────────────
     if (!is_options && !check_auth(req, resolved)) {
-        std::cerr << "[AUTH] 401 for " << req.method_str << " " << req.path
-                  << " (Authorization: " << (req.header("Authorization").has_value() ? "present" : "missing") << ")"
-                  << std::endl;
         http::Response resp;
         resp.status_code = 401;
         resp.status_text = "Unauthorized";
@@ -412,6 +361,7 @@ http::Response WebDavHandler::handle(const http::Request& req) {
         resp.set_content_type("text/html; charset=utf-8");
         std::string body = "<!DOCTYPE html><html><body><h1>401 Unauthorized</h1></body></html>";
         resp.set_content_length(body.size());
+        add_security_headers(resp);
         resp.body = std::move(body);
         return resp;
     }
@@ -434,8 +384,7 @@ http::Response WebDavHandler::handle(const http::Request& req) {
 }
 
 http::Response WebDavHandler::handle_options(const http::Request& req, const fs::path& resolved) {
-    (void)req;
-    (void)resolved;
+    (void)req; (void)resolved;
     http::Response resp;
     resp.status_code = 200;
     add_common_headers(resp);
@@ -454,7 +403,6 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
         std::string path = req.path;
         if (path.empty()) path = "/";
 
-        // Build server origin for thumbnail URLs
         std::string origin;
         auto host_hdr = req.header("Host");
         if (host_hdr) {
@@ -466,6 +414,7 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
         http::Response resp;
         resp.status_code = 200;
         add_common_headers(resp);
+        add_security_headers(resp);
         resp.set_content_type("text/html; charset=utf-8");
         resp.set_content_length(html.size());
         resp.body = std::move(html);
@@ -473,23 +422,15 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     }
 
     // ── Browser requesting a media file → serve player page ───────────────
-    // When auth is enabled, the player page embeds a temporary media token
-    // in the video/audio source URL so the browser's media element can
-    // access the file without sending HTTP Basic auth credentials (which
-    // <video>/<audio> elements don't reliably include in subresource requests).
-    // Without auth, skip the player page — serve the file directly so the
-    // browser can start playing immediately (one round-trip instead of two).
-    bool needs_player_page = (username_ && password_)   // auth requires token
+    bool needs_player_page = (username_ && password_)
                           && is_browser_request(req)
                           && prefers_html(req)
-                          && is_media_file(resolved);
+                          && thumbnail::is_media_file(resolved.filename().string());
     if (needs_player_page) {
-        // Check if this is a raw media request (from the player page itself)
         bool has_mtoken = req.query.find("mtoken=") != std::string::npos;
         if (!has_mtoken) {
             return serve_media_player_page(req, resolved);
         }
-        // else: query contains a media token → fall through to serve raw file
     }
 
     // ── Regular file → sendfile (zero-copy) + Range support ───────────────
@@ -502,12 +443,10 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     resp.set_content_type(utils::mime_type(resolved.string()));
 
     if (range && fsize > 0) {
-        // Clamp range to file size
         size_t range_start = range->start;
         size_t range_end   = range->end.value_or(static_cast<size_t>(fsize) - 1);
 
         if (range_start >= fsize) {
-            // Range Not Satisfiable
             resp.status_code = 416;
             resp.set_header("Content-Range", "bytes */" + std::to_string(fsize));
             resp.set_content_length(0);
@@ -515,7 +454,6 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
         }
 
         if (range_end >= fsize) range_end = static_cast<size_t>(fsize) - 1;
-
         size_t content_len = range_end - range_start + 1;
 
         resp.status_code = 206;
@@ -529,7 +467,6 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             resp.file_offset = static_cast<off_t>(range_start);
         }
     } else {
-        // Full file
         resp.status_code = 200;
         resp.set_content_length(static_cast<size_t>(fsize));
         if (fsize > 0) {
@@ -558,20 +495,42 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
     if (existed && file_ops::is_regular_file(resolved)) {
         int lock_fd = file_ops::try_lock_exclusive(resolved);
         if (lock_fd == -1) {
-            // File is currently being streamed — reject
             return error_response(423, "Locked — file is being read");
         }
-        if (lock_fd >= 0) ::close(lock_fd);  // release lock, we'll write now
+        if (lock_fd >= 0) ::close(lock_fd);
     }
 
-    if (!file_ops::write_file(resolved, req.body)) {
-        return error_response(507, "Insufficient Storage");
+    auto cl = req.content_length();
+    size_t body_size = cl.value_or(0);
+
+    // ── Small body: handle in memory (existing behavior) ──────────────────
+    if (body_size <= STREAMING_PUT_THRESHOLD) {
+        if (!file_ops::write_file(resolved, req.body)) {
+            return error_response(507, "Insufficient Storage");
+        }
+        http::Response resp;
+        resp.status_code = existed ? 200 : 201;
+        add_common_headers(resp);
+        resp.set_content_length(0);
+        return resp;
     }
 
+    // ── Large body: stream to disk ────────────────────────────────────────
+    // Open temp file alongside destination
+    fs::path tmp_path(resolved.string() + ".webdav-tmp." + std::to_string(getpid()));
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return error_response(507, "Insufficient Storage — cannot create temp file");
+    }
+
+    // Tell the server to stream the body into this fd
     http::Response resp;
     resp.status_code = existed ? 200 : 201;
     add_common_headers(resp);
     resp.set_content_length(0);
+    resp.body_output_fd = fd;
+    resp.body_expected = body_size;
+    resp.body_output_path = resolved.string();  // rename tmp → this on success
     return resp;
 }
 
@@ -581,7 +540,6 @@ http::Response WebDavHandler::handle_delete(const http::Request& req, const fs::
         return error_response(404, "Not Found");
     }
 
-    // For regular files: check if in use before deleting
     if (file_ops::is_regular_file(resolved)) {
         int lock_fd = file_ops::try_lock_exclusive(resolved);
         if (lock_fd == -1) {
@@ -669,7 +627,6 @@ http::Response WebDavHandler::handle_move(const http::Request& req, const fs::pa
         return error_response(404, "Not Found");
     }
 
-    // For regular files: check if source file is in use
     if (file_ops::is_regular_file(resolved)) {
         int lock_fd = file_ops::try_lock_exclusive(resolved);
         if (lock_fd == -1) {
@@ -685,7 +642,6 @@ http::Response WebDavHandler::handle_move(const http::Request& req, const fs::pa
         return error_response(412, "Precondition Failed");
     }
 
-    // Also check destination if overwriting
     if (file_ops::exists(dest_resolved) && file_ops::is_regular_file(dest_resolved)) {
         int lock_fd = file_ops::try_lock_exclusive(dest_resolved);
         if (lock_fd == -1) {
