@@ -424,7 +424,21 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             origin = "http://" + std::string(*host_hdr);
         }
 
-        // ETag from directory mtime (revalidate when contents change)
+        // ── Generate media tokens for thumbnail <img> tags ──────────────
+        std::unordered_map<std::string, std::string> tokens;
+        if (username_ && password_) {
+            auto entries = file_ops::list_directory(resolved);
+            for (const auto& e : entries) {
+                if (!e.is_directory && thumbnail::is_media_file(e.name)) {
+                    fs::path full = resolved / e.name;
+                    tokens[e.name] = generate_media_token(full);
+                }
+            }
+        }
+        const std::unordered_map<std::string, std::string>* token_ptr =
+            tokens.empty() ? nullptr : &tokens;
+
+        // ── ETag from directory mtime ──────────────────────────────────
         auto dir_mtime = file_ops::last_modified(resolved);
         auto dir_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             dir_mtime.time_since_epoch()).count();
@@ -441,7 +455,7 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             return resp;
         }
 
-        std::string html = html_dir::generate(path, resolved, origin);
+        std::string html = html_dir::generate(path, resolved, origin, token_ptr);
 
         http::Response resp;
         resp.status_code = 200;

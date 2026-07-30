@@ -132,7 +132,8 @@ static std::string image_icon_svg() {
 // ── Main generator ───────────────────────────────────────────────────────────
 
 std::string generate(std::string_view path, const fs::path& resolved_path,
-                     std::string_view server_origin) {
+                     std::string_view server_origin,
+                     const std::unordered_map<std::string, std::string>* media_tokens) {
     auto entries = file_ops::list_directory(resolved_path);
 
     // ── Separate entries by type ──────────────────────────────────────────
@@ -252,6 +253,14 @@ std::string generate(std::string_view path, const fs::path& resolved_path,
             // Encode the file path for the thumbnail URL
             std::string file_url = utils::url_encode(display_path) + utils::url_encode(entry.name);
             std::string thumb_url = thumb_prefix + utils::url_encode(display_path + entry.name);
+
+            // Append media token for auth-bypassed thumbnails
+            if (media_tokens) {
+                auto it = media_tokens->find(entry.name);
+                if (it != media_tokens->end()) {
+                    thumb_url += "&mtoken=" + it->second;
+                }
+            }
 
             h += "<div class=\"media-card\">\r\n";
             h += "  <a href=\"";
