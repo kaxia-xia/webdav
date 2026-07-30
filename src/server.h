@@ -23,6 +23,7 @@ public:
 
     static constexpr size_t PIPE_CAPACITY  = 1048576;
     static constexpr size_t READ_BUF_SIZE  = 16384;
+    static constexpr unsigned POOL_BLOCK   = 64;
 
 private:
     int port_;
@@ -67,6 +68,9 @@ private:
         bool existed_before_put = false;
         bool put_write_pending = false;
         size_t put_write_size = 0;
+
+        // Free list for object pool
+        Connection* pool_next = nullptr;
     };
 
     void worker_loop(unsigned worker_id, int listen_fd);
