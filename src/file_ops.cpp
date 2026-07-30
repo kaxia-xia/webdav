@@ -143,7 +143,10 @@ bool copy(const fs::path& from, const fs::path& to) {
 
 DirEntry get_entry(const fs::path& p) {
     DirEntry de;
-    de.name = p.filename().string();
+    // Handle paths with trailing slash (filename() returns "" for "foo/")
+    std::string ps = p.string();
+    if (ps.size() > 1 && ps.back() == '/') ps.pop_back();
+    de.name = fs::path(ps).filename().string();
     de.is_directory = file_ops::is_directory(p);
     if (de.is_directory) {
         de.size = 0;
