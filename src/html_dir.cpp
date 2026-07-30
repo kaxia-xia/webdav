@@ -268,8 +268,9 @@ std::string generate(std::string_view path, const fs::path& resolved_path,
             h += "\">\r\n";
             h += "    <div class=\"media-thumb\">\r\n";
             // Use <img> tag pointing to thumbnail endpoint; onerror shows fallback
+            // NOTE: thumb_url already URL-encoded, don't HTML-escape (would break &amp;)
             h += "      <img src=\"";
-            h += escape_html(thumb_url);
+            h += thumb_url;
             h += "\" alt=\"";
             h += escape_html(entry.name);
             h += "\" loading=\"lazy\"";
