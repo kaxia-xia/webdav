@@ -195,7 +195,7 @@ void Server::worker_loop() {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
         io_uring_prep_write(sqe, conn->output_fd,
-                            conn->read_buf, conn->put_write_size, 0);
+                            conn->read_buf, conn->put_write_size, -1);
         io_uring_sqe_set_data(sqe, conn);
         return true;
     };
