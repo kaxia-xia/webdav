@@ -134,7 +134,7 @@ namespace {
     using MimeEntry = std::pair<std::string_view, std::string_view>;
 
     // MUST stay sorted by extension for binary_search
-    constexpr std::array<MimeEntry, 55> kMimeMap = {{
+    constexpr std::array<MimeEntry, 60> kMimeMap = {{
         {".aac",   "audio/aac"},
         {".avi",   "video/x-msvideo"},
         {".bmp",   "image/bmp"},
@@ -150,6 +150,8 @@ namespace {
         {".go",    "text/plain; charset=utf-8"},
         {".gz",    "application/gzip"},
         {".h",     "text/plain; charset=utf-8"},
+        {".heic",  "image/heic"},
+        {".heif",  "image/heif"},
         {".hh",    "text/plain; charset=utf-8"},
         {".hpp",   "text/plain; charset=utf-8"},
         {".htm",   "text/html; charset=utf-8"},
@@ -161,7 +163,9 @@ namespace {
         {".jpg",   "image/jpeg"},
         {".js",    "application/javascript; charset=utf-8"},
         {".json",  "application/json; charset=utf-8"},
+        {".m3u8",  "application/vnd.apple.mpegurl"},
         {".m4a",   "audio/mp4"},
+        {".m4v",   "video/x-m4v"},
         {".md",    "text/markdown; charset=utf-8"},
         {".mkv",   "video/x-matroska"},
         {".mov",   "video/quicktime"},
@@ -179,6 +183,7 @@ namespace {
         {".tar",   "application/x-tar"},
         {".tiff",  "image/tiff"},
         {".toml",  "text/plain; charset=utf-8"},
+        {".ts",    "video/mp2t"},
         {".txt",   "text/plain; charset=utf-8"},
         {".wav",   "audio/wav"},
         {".webm",  "video/webm"},

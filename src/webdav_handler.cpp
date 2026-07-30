@@ -100,7 +100,7 @@ bool WebDavHandler::check_auth(const http::Request& req, const fs::path& resolve
 // ── Headers ──────────────────────────────────────────────────────────────────
 
 void WebDavHandler::add_common_headers(http::Response& resp) {
-    resp.set_header("Server", "WebDAV-Server/1.2 (C++20)");
+    resp.set_header("Server", "WebDAV-Server/1.3 (C++20)");
     resp.set_header("Date", utils::rfc1123_now());
     resp.set_header("Accept-Ranges", "bytes");
 }

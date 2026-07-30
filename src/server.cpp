@@ -72,6 +72,8 @@ void Server::close_connection(Connection* conn) {
     if (conn->fd >= 0)         { ::close(conn->fd); conn->fd = -1; }
     if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
     if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
+    if (conn->splice_pipe[0] >= 0) { ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1; }
+    if (conn->splice_pipe[1] >= 0) { ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1; }
     // Clean up incomplete upload temp file
     if (!conn->output_tmp_path.empty()) {
         ::unlink(conn->output_tmp_path.c_str());
@@ -88,27 +90,28 @@ void Server::reset_connection(Connection* conn) {
     conn->send_offset = 0;
     conn->keep_alive = true;
     if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
+    if (conn->splice_pipe[0] >= 0) { ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1; }
+    if (conn->splice_pipe[1] >= 0) { ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1; }
     conn->file_remaining = 0;
-    conn->file_data_ready = false;
+    conn->splice_pending = 0;
+    conn->splice_phase = SplicePhase::TO_PIPE;
     if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
     conn->body_expected = 0;
     conn->body_received = 0;
+    conn->put_write_pending = false;
+    conn->put_write_size = 0;
 }
 
 std::string Server::build_response_string(int code, bool keep_alive) {
     http::Response resp;
     resp.status_code = code;
-    resp.set_header("Server", "WebDAV-Server/1.2 (C++20)");
+    resp.set_header("Server", "WebDAV-Server/1.3 (C++20)");
     resp.set_header("Date", utils::rfc1123_now());
     resp.set_header("Accept-Ranges", "bytes");
     resp.set_header("Connection", keep_alive ? "keep-alive" : "close");
     resp.set_content_length(0);
     return resp.to_string();
 }
-
-// ── io_uring submission macros (inlined to avoid private-access issues) ──────
-//
-// These are defined as lambdas inside worker_loop() to have access to the ring.
 
 // ── Worker thread (io_uring event loop) ──────────────────────────────────────
 
@@ -123,7 +126,8 @@ void Server::worker_loop() {
         return;
     }
 
-    // io_uring submission helpers (access ring and Connection private members)
+    // ── Submission lambdas ──────────────────────────────────────────────────
+
     auto uring_accept = [&]() -> bool {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
@@ -152,20 +156,41 @@ void Server::worker_loop() {
         return true;
     };
 
-    auto uring_read_file = [&](Connection* conn) -> bool {
+    // ── Zero-copy splice helpers (file ↔ pipe ↔ socket) ──────────────────
+
+    auto uring_splice_to_pipe = [&](Connection* conn) -> bool {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
         size_t chunk = conn->file_remaining;
-        if (chunk > BUF_SIZE) chunk = BUF_SIZE;
-        io_uring_prep_read(sqe, conn->file_fd, conn->file_buf, chunk, conn->file_off);
+        if (chunk > PIPE_CAPACITY) chunk = PIPE_CAPACITY;
+        // splice(file_fd @ file_off  →  pipe[1])
+        io_uring_prep_splice(sqe, conn->file_fd, conn->file_off,
+                             conn->splice_pipe[1], -1,
+                             static_cast<unsigned>(chunk),
+                             SPLICE_F_MOVE | SPLICE_F_MORE);
         io_uring_sqe_set_data(sqe, conn);
         return true;
     };
 
-    auto uring_send_file_chunk = [&](Connection* conn, size_t len) -> bool {
+    auto uring_splice_to_socket = [&](Connection* conn) -> bool {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
-        io_uring_prep_send(sqe, conn->fd, conn->file_buf, len, 0);
+        // splice(pipe[0]  →  conn->fd)
+        io_uring_prep_splice(sqe, conn->splice_pipe[0], -1,
+                             conn->fd, -1,
+                             static_cast<unsigned>(conn->splice_pending),
+                             SPLICE_F_MOVE | SPLICE_F_MORE);
+        io_uring_sqe_set_data(sqe, conn);
+        return true;
+    };
+
+    // ── Async write helper (PUT streaming) ───────────────────────────────
+
+    auto uring_write_body = [&](Connection* conn) -> bool {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return false;
+        io_uring_prep_write(sqe, conn->output_fd,
+                            conn->read_buf, conn->put_write_size, 0);
         io_uring_sqe_set_data(sqe, conn);
         return true;
     };
@@ -226,7 +251,7 @@ void Server::worker_loop() {
 
                 const auto& req = conn->parser.request();
 
-                // ── Streaming PUT ─────────────────────────────────────────
+                // ── Streaming PUT ──────────────────────────────────────
                 if (req.body_truncated && req.method == http::Method::PUT) {
                     http::Response resp = handler_.handle(req);
 
@@ -238,25 +263,30 @@ void Server::worker_loop() {
                         conn->body_expected = resp.body_expected;
                         conn->body_received = 0;
                         conn->existed_before_put = (resp.status_code == 200);
+                        conn->put_write_pending = false;
 
                         std::string_view lv = conn->parser.leftover();
                         if (!lv.empty()) {
-                            ssize_t w = ::write(conn->output_fd, lv.data(), lv.size());
-                            if (w < 0) { close_connection(conn); break; }
-                            conn->body_received += static_cast<size_t>(w);
-                        }
+                            // Write leftover asynchronously
+                            conn->put_write_size = lv.size();
+                            memmove(conn->read_buf, lv.data(), lv.size());
+                            conn->body_received = lv.size();
 
-                        if (conn->body_received >= conn->body_expected) {
-                            ::close(conn->output_fd); conn->output_fd = -1;
-                            // Rename temp file to final destination (fast path)
-                            if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
-                                ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
+                            if (conn->body_received >= conn->body_expected) {
+                                ::close(conn->output_fd); conn->output_fd = -1;
+                                if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
+                                    ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
+                                }
+                                conn->response_data = build_response_string(
+                                    conn->existed_before_put ? 200 : 201, conn->keep_alive);
+                                conn->send_offset = 0;
+                                conn->state = State::SENDING_HEADERS;
+                                if (!uring_send(conn)) close_connection(conn);
+                                break;
                             }
-                            conn->response_data = build_response_string(
-                                conn->existed_before_put ? 200 : 201, conn->keep_alive);
-                            conn->send_offset = 0;
-                            conn->state = State::SENDING_HEADERS;
-                            if (!uring_send(conn)) close_connection(conn);
+
+                            conn->put_write_pending = true;
+                            if (!uring_write_body(conn)) close_connection(conn);
                             break;
                         }
 
@@ -275,7 +305,7 @@ void Server::worker_loop() {
                     break;
                 }
 
-                // ── Normal request ────────────────────────────────────────
+                // ── Normal request ─────────────────────────────────────
                 {
                     http::Response resp = handler_.handle(req);
                     auto ch = req.header("Connection");
@@ -289,13 +319,20 @@ void Server::worker_loop() {
                     conn->response_data = resp.to_string();
                     conn->send_offset = 0;
 
+                    // ── File send: set up splice pipe ────────────────
                     if (resp.file_to_send) {
                         conn->file_fd = ::open(resp.file_to_send->c_str(), O_RDONLY);
                         if (conn->file_fd < 0) { close_connection(conn); break; }
                         file_ops::lock_shared(conn->file_fd);
                         conn->file_off = resp.file_offset;
                         conn->file_remaining = resp.content_length_opt().value_or(0);
-                        conn->file_data_ready = false;
+
+                        // Create pipe for zero-copy splice
+                        if (::pipe2(conn->splice_pipe, O_NONBLOCK) < 0) {
+                            close_connection(conn); break;
+                        }
+                        conn->splice_phase = SplicePhase::TO_PIPE;
+                        conn->splice_pending = 0;
                     }
 
                     conn->state = State::SENDING_HEADERS;
@@ -306,38 +343,52 @@ void Server::worker_loop() {
 
             // ══════════════════════════════════════════════════════════════
             case State::RECEIVING_BODY: {
+                if (conn->put_write_pending) {
+                    // ── Write completion ───────────────────────────────
+                    conn->put_write_pending = false;
+                    if (res < 0) {
+                        if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                        if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
+                        close_connection(conn);
+                        break;
+                    }
+                    // body_received already incremented before write submission
+                    if (conn->body_received >= conn->body_expected) {
+                        ::close(conn->output_fd); conn->output_fd = -1;
+                        if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
+                            ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
+                        }
+                        conn->response_data = build_response_string(
+                            conn->existed_before_put ? 200 : 201, conn->keep_alive);
+                        conn->send_offset = 0;
+                        conn->state = State::SENDING_HEADERS;
+                        if (!uring_send(conn)) close_connection(conn);
+                        break;
+                    }
+                    // Submit next recv
+                    conn->read_offset = 0;
+                    if (!uring_recv(conn)) close_connection(conn);
+                    break;
+                }
+
+                // ── Recv completion ────────────────────────────────────
                 if (res <= 0) {
                     if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
-                    // Upload failed — remove temp file
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
                     break;
                 }
 
-                ssize_t w = ::write(conn->output_fd, conn->read_buf, static_cast<size_t>(res));
-                if (w < 0) {
+                // Submit async write
+                conn->put_write_size = static_cast<size_t>(res);
+                conn->put_write_pending = true;
+                conn->body_received += static_cast<size_t>(res);
+
+                if (!uring_write_body(conn)) {
                     if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
-                    // Upload failed — remove temp file
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
-                    break;
                 }
-                conn->body_received += static_cast<size_t>(w);
-
-                if (conn->body_received >= conn->body_expected) {
-                    ::close(conn->output_fd); conn->output_fd = -1;
-                    // Rename temp file to final destination
-                    if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
-                        ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
-                    }
-                    conn->response_data = build_response_string(
-                        conn->existed_before_put ? 200 : 201, conn->keep_alive);
-                    conn->send_offset = 0;
-                    conn->state = State::SENDING_HEADERS;
-                    if (!uring_send(conn)) close_connection(conn);
-                    break;
-                }
-                if (!uring_recv(conn)) close_connection(conn);
                 break;
             }
 
@@ -352,8 +403,10 @@ void Server::worker_loop() {
                 }
 
                 if (conn->file_fd >= 0 && conn->file_remaining > 0) {
+                    // Kick off zero-copy splice: file → pipe
                     conn->state = State::SENDING_FILE;
-                    if (!uring_read_file(conn)) close_connection(conn);
+                    conn->splice_phase = SplicePhase::TO_PIPE;
+                    if (!uring_splice_to_pipe(conn)) close_connection(conn);
                 } else if (conn->keep_alive) {
                     reset_connection(conn);
                     if (!uring_recv(conn)) close_connection(conn);
@@ -364,26 +417,48 @@ void Server::worker_loop() {
             }
 
             // ══════════════════════════════════════════════════════════════
+            //  Zero-copy file send via splice(2):
+            //    file_fd → pipe → socket   (all in kernel, no userspace copy)
+            // ══════════════════════════════════════════════════════════════
             case State::SENDING_FILE: {
                 if (res <= 0) { close_connection(conn); break; }
 
-                if (!conn->file_data_ready) {
-                    size_t bytes = static_cast<size_t>(res);
-                    conn->file_off += static_cast<off_t>(bytes);
-                    conn->file_remaining -= bytes;
-                    conn->file_data_ready = true;
-                    if (!uring_send_file_chunk(conn, bytes)) close_connection(conn);
+                if (conn->splice_phase == SplicePhase::TO_PIPE) {
+                    // Just completed splice(file → pipe)
+                    conn->splice_pending = static_cast<size_t>(res);
+                    conn->splice_phase = SplicePhase::TO_SOCKET;
+
+                    if (!uring_splice_to_socket(conn)) close_connection(conn);
                 } else {
-                    conn->file_data_ready = false;
-                    if (conn->file_remaining > 0) {
-                        if (!uring_read_file(conn)) close_connection(conn);
+                    // Just completed splice(pipe → socket)
+                    size_t sent = static_cast<size_t>(res);
+
+                    if (sent < conn->splice_pending) {
+                        // Short write — socket buffer full, retry remainder
+                        conn->splice_pending -= sent;
+                        // stay in TO_SOCKET, resubmit
+                        if (!uring_splice_to_socket(conn)) close_connection(conn);
                     } else {
-                        ::close(conn->file_fd); conn->file_fd = -1;
-                        if (conn->keep_alive) {
-                            reset_connection(conn);
-                            if (!uring_recv(conn)) close_connection(conn);
+                        // All pipe data consumed → advance file cursor
+                        conn->file_off += static_cast<off_t>(conn->splice_pending);
+                        conn->file_remaining -= conn->splice_pending;
+                        conn->splice_pending = 0;
+
+                        if (conn->file_remaining > 0) {
+                            // More file data → next chunk
+                            conn->splice_phase = SplicePhase::TO_PIPE;
+                            if (!uring_splice_to_pipe(conn)) close_connection(conn);
                         } else {
-                            close_connection(conn);
+                            // Done!
+                            ::close(conn->file_fd); conn->file_fd = -1;
+                            ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
+                            ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
+                            if (conn->keep_alive) {
+                                reset_connection(conn);
+                                if (!uring_recv(conn)) close_connection(conn);
+                            } else {
+                                close_connection(conn);
+                            }
                         }
                     }
                 }
@@ -433,7 +508,7 @@ void Server::run() {
     shutdown_eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
     std::cout << "[INFO] http://0.0.0.0:" << port_ << " — " << handler_.root_dir() << std::endl;
-    std::cout << "[INFO] I/O: io_uring (kernel 6.6, liburing 2.1)" << std::endl;
+    std::cout << "[INFO] I/O: io_uring + splice zero-copy (kernel 6.6, liburing 2.1)" << std::endl;
 
     workers_.reserve(num_workers_);
     for (unsigned i = 0; i < num_workers_; ++i) {
