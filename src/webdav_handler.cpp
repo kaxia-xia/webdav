@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -532,8 +533,12 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
     }
 
     // ── Large body: stream to disk ────────────────────────────────────────
-    // Open temp file alongside destination
-    fs::path tmp_path(normalized.string() + ".webdav-tmp." + std::to_string(getpid()));
+    // Open temp file alongside destination (unique per call via μs timestamp)
+    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::string tmp_suffix = ".webdav-tmp." + std::to_string(getpid())
+                           + "." + std::to_string(now_us);
+    fs::path tmp_path(normalized.string() + tmp_suffix);
     int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         return error_response(507, "Insufficient Storage — cannot create temp file");

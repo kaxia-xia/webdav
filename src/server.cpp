@@ -72,6 +72,11 @@ void Server::close_connection(Connection* conn) {
     if (conn->fd >= 0)         { ::close(conn->fd); conn->fd = -1; }
     if (conn->file_fd >= 0)    { ::close(conn->file_fd); conn->file_fd = -1; }
     if (conn->output_fd >= 0)  { ::close(conn->output_fd); conn->output_fd = -1; }
+    // Clean up incomplete upload temp file
+    if (!conn->output_tmp_path.empty()) {
+        ::unlink(conn->output_tmp_path.c_str());
+        conn->output_tmp_path.clear();
+    }
     delete conn;
 }
 
@@ -243,6 +248,10 @@ void Server::worker_loop() {
 
                         if (conn->body_received >= conn->body_expected) {
                             ::close(conn->output_fd); conn->output_fd = -1;
+                            // Rename temp file to final destination (fast path)
+                            if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
+                                ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
+                            }
                             conn->response_data = build_response_string(
                                 conn->existed_before_put ? 200 : 201, conn->keep_alive);
                             conn->send_offset = 0;
