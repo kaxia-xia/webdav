@@ -24,10 +24,6 @@ struct DirEntry {
 // Returns empty path if attempting path traversal.
 fs::path resolve_path(const fs::path& root_dir, std::string_view request_path);
 
-// Check if a resolved path would escape root via symlinks.
-// Returns true if safe, false if a symlink points outside root.
-bool is_safe_path(const fs::path& root_dir, const fs::path& resolved);
-
 // Check if path exists
 bool exists(const fs::path& p);
 

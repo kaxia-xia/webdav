@@ -34,17 +34,17 @@ private:
 
     enum class State {
         READING_REQUEST,
-        RECEIVING_BODY,    // streaming PUT body to disk
+        RECEIVING_BODY,    // streaming PUT body to disk (async io_uring write)
         SENDING_HEADERS,
-        SENDING_FILE,      // zero-copy file send via splice
+        SENDING_FILE,      // zero-copy file send via splice(2)
         CLOSING,
     };
 
-    // Phase within SENDING_FILE
+    // Phase within SENDING_FILE (splice pipeline)
     enum class SplicePhase { TO_PIPE, TO_SOCKET };
 
     static constexpr size_t READ_BUF_SIZE  = 65536;
-    static constexpr size_t PIPE_CAPACITY  = 65536;
+    static constexpr size_t PIPE_CAPACITY  = 1048576;  // 1 MiB — fewer splice rounds
 
     struct Connection {
         int fd = -1;
@@ -60,11 +60,11 @@ private:
         std::string response_data;
         size_t send_offset = 0;
 
-        // ── File serving (GET) — zero-copy via splice ──────────────────
+        // ── File serving (GET) — zero-copy via splice(2) ───────────────
         int file_fd = -1;
         off_t file_off = 0;
         size_t file_remaining = 0;
-        int splice_pipe[2] = {-1, -1};   // pipe for splice(2) zero-copy
+        int splice_pipe[2] = {-1, -1};
         SplicePhase splice_phase = SplicePhase::TO_PIPE;
         size_t splice_pending = 0;       // bytes waiting in pipe → socket
 
@@ -76,7 +76,7 @@ private:
         size_t body_received = 0;
         bool existed_before_put = false;
         bool put_write_pending = false;  // true = next CQE is write completion
-        size_t put_write_size = 0;       // bytes in read_buf to write
+        size_t put_write_size = 0;
     };
 
     void worker_loop();

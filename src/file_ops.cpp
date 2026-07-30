@@ -38,39 +38,6 @@ fs::path resolve_path(const fs::path& root_dir, std::string_view request_path) {
     return resolved;
 }
 
-bool is_safe_path(const fs::path& root_dir, const fs::path& resolved) {
-    // Canonicalise both paths — resolves symlinks and ".."
-    std::error_code ec;
-    fs::path real_root = fs::canonical(root_dir, ec);
-    if (ec) return false;
-
-    // The resolved path may not exist yet (e.g. PUT to a new file).
-    // Walk up until we find an existing ancestor, canonicalise that,
-    // then append the non-existent tail.
-    fs::path real_resolved;
-    fs::path tail;
-    fs::path current = resolved;
-
-    while (!fs::exists(current, ec) && current.has_parent_path()) {
-        tail = current.filename() / tail;
-        current = current.parent_path();
-    }
-
-    current = fs::canonical(current, ec);
-    if (ec) return false;
-
-    real_resolved = current / tail;
-    real_resolved = real_resolved.lexically_normal();
-
-    std::string root_s = real_root.string();
-    std::string resolved_s = real_resolved.string();
-
-    if (!root_s.empty() && root_s.back() != '/') root_s += '/';
-    if (!resolved_s.empty() && resolved_s.back() != '/') resolved_s += '/';
-
-    return resolved_s.starts_with(root_s);
-}
-
 bool exists(const fs::path& p) {
     std::error_code ec;
     return fs::exists(p, ec);

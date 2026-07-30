@@ -79,6 +79,9 @@ void Server::close_connection(Connection* conn) {
         ::unlink(conn->output_tmp_path.c_str());
         conn->output_tmp_path.clear();
     }
+    // Clean up renamed but abandoned file (write completed, rename done,
+    // but connection died before response sent — file is valid but orphaned
+    // from the client's perspective; we leave it since rename already happened)
     delete conn;
 }
 
@@ -100,6 +103,8 @@ void Server::reset_connection(Connection* conn) {
     conn->body_received = 0;
     conn->put_write_pending = false;
     conn->put_write_size = 0;
+    conn->output_tmp_path.clear();
+    conn->output_final_path.clear();
 }
 
 std::string Server::build_response_string(int code, bool keep_alive) {
@@ -112,6 +117,8 @@ std::string Server::build_response_string(int code, bool keep_alive) {
     resp.set_content_length(0);
     return resp.to_string();
 }
+
+// ── ETag generator (weak, from mtime + size) ─────────────────────────────────
 
 // ── Worker thread (io_uring event loop) ──────────────────────────────────────
 
@@ -163,7 +170,6 @@ void Server::worker_loop() {
         if (!sqe) return false;
         size_t chunk = conn->file_remaining;
         if (chunk > PIPE_CAPACITY) chunk = PIPE_CAPACITY;
-        // splice(file_fd @ file_off  →  pipe[1])
         io_uring_prep_splice(sqe, conn->file_fd, conn->file_off,
                              conn->splice_pipe[1], -1,
                              static_cast<unsigned>(chunk),
@@ -175,7 +181,6 @@ void Server::worker_loop() {
     auto uring_splice_to_socket = [&](Connection* conn) -> bool {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
-        // splice(pipe[0]  →  conn->fd)
         io_uring_prep_splice(sqe, conn->splice_pipe[0], -1,
                              conn->fd, -1,
                              static_cast<unsigned>(conn->splice_pending),
@@ -267,24 +272,12 @@ void Server::worker_loop() {
 
                         std::string_view lv = conn->parser.leftover();
                         if (!lv.empty()) {
-                            // Write leftover asynchronously
+                            // Submit async write for leftover — always,
+                            // even if it's the entire body. Completion
+                            // handled in RECEIVING_BODY.
                             conn->put_write_size = lv.size();
                             memmove(conn->read_buf, lv.data(), lv.size());
                             conn->body_received = lv.size();
-
-                            if (conn->body_received >= conn->body_expected) {
-                                ::close(conn->output_fd); conn->output_fd = -1;
-                                if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
-                                    ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
-                                }
-                                conn->response_data = build_response_string(
-                                    conn->existed_before_put ? 200 : 201, conn->keep_alive);
-                                conn->send_offset = 0;
-                                conn->state = State::SENDING_HEADERS;
-                                if (!uring_send(conn)) close_connection(conn);
-                                break;
-                            }
-
                             conn->put_write_pending = true;
                             if (!uring_write_body(conn)) close_connection(conn);
                             break;
@@ -327,10 +320,12 @@ void Server::worker_loop() {
                         conn->file_off = resp.file_offset;
                         conn->file_remaining = resp.content_length_opt().value_or(0);
 
-                        // Create pipe for zero-copy splice
+                        // Create pipe + expand to 1 MiB for fewer splice rounds
                         if (::pipe2(conn->splice_pipe, O_NONBLOCK) < 0) {
                             close_connection(conn); break;
                         }
+                        ::fcntl(conn->splice_pipe[0], F_SETPIPE_SZ, PIPE_CAPACITY);
+                        ::fcntl(conn->splice_pipe[1], F_SETPIPE_SZ, PIPE_CAPACITY);
                         conn->splice_phase = SplicePhase::TO_PIPE;
                         conn->splice_pending = 0;
                     }
@@ -344,7 +339,7 @@ void Server::worker_loop() {
             // ══════════════════════════════════════════════════════════════
             case State::RECEIVING_BODY: {
                 if (conn->put_write_pending) {
-                    // ── Write completion ───────────────────────────────
+                    // ── Async write completion ─────────────────────────
                     conn->put_write_pending = false;
                     if (res < 0) {
                         if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
@@ -352,12 +347,14 @@ void Server::worker_loop() {
                         close_connection(conn);
                         break;
                     }
-                    // body_received already incremented before write submission
+                    // body_received was incremented before write submission
                     if (conn->body_received >= conn->body_expected) {
                         ::close(conn->output_fd); conn->output_fd = -1;
                         if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
                             ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
                         }
+                        conn->output_tmp_path.clear();
+                        conn->output_final_path.clear();
                         conn->response_data = build_response_string(
                             conn->existed_before_put ? 200 : 201, conn->keep_alive);
                         conn->send_offset = 0;
@@ -371,7 +368,7 @@ void Server::worker_loop() {
                     break;
                 }
 
-                // ── Recv completion ────────────────────────────────────
+                // ── Recv completion → submit async write ──────────────
                 if (res <= 0) {
                     if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
@@ -379,7 +376,6 @@ void Server::worker_loop() {
                     break;
                 }
 
-                // Submit async write
                 conn->put_write_size = static_cast<size_t>(res);
                 conn->put_write_pending = true;
                 conn->body_received += static_cast<size_t>(res);
@@ -419,6 +415,7 @@ void Server::worker_loop() {
             // ══════════════════════════════════════════════════════════════
             //  Zero-copy file send via splice(2):
             //    file_fd → pipe → socket   (all in kernel, no userspace copy)
+            //  Pipe is 1 MiB — reduces syscall count ~16× vs default 64 KiB.
             // ══════════════════════════════════════════════════════════════
             case State::SENDING_FILE: {
                 if (res <= 0) { close_connection(conn); break; }
@@ -436,7 +433,6 @@ void Server::worker_loop() {
                     if (sent < conn->splice_pending) {
                         // Short write — socket buffer full, retry remainder
                         conn->splice_pending -= sent;
-                        // stay in TO_SOCKET, resubmit
                         if (!uring_splice_to_socket(conn)) close_connection(conn);
                     } else {
                         // All pipe data consumed → advance file cursor
@@ -508,7 +504,7 @@ void Server::run() {
     shutdown_eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
     std::cout << "[INFO] http://0.0.0.0:" << port_ << " — " << handler_.root_dir() << std::endl;
-    std::cout << "[INFO] I/O: io_uring + splice zero-copy (kernel 6.6, liburing 2.1)" << std::endl;
+    std::cout << "[INFO] I/O: io_uring + splice (1 MiB pipe) — kernel 6.6, liburing 2.1" << std::endl;
 
     workers_.reserve(num_workers_);
     for (unsigned i = 0; i < num_workers_; ++i) {

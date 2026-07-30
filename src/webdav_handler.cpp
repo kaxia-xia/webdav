@@ -451,10 +451,28 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
     // ── Regular file → sendfile (zero-copy) + Range support ───────────────
     uintmax_t fsize = file_ops::file_size(resolved);
     auto range = req.parse_range(fsize);
+    auto last_mod = file_ops::last_modified(resolved);
+    auto lm_dur = last_mod.time_since_epoch();
+    auto lm_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(lm_dur).count();
+    std::string etag = "\"" + std::to_string(lm_ns) + "-" + std::to_string(fsize) + "\"";
+
+    // ── Conditional GET: If-None-Match / If-Modified-Since ──────────────
+    auto inm = req.header("If-None-Match");
+    if (inm && *inm == etag) {
+        http::Response resp;
+        resp.status_code = 304;
+        add_common_headers(resp);
+        resp.set_header("ETag", etag);
+        resp.set_header("Cache-Control", "public, max-age=3600");
+        resp.set_content_length(0);
+        return resp;
+    }
 
     http::Response resp;
     add_common_headers(resp);
-    resp.set_header("Last-Modified", utils::rfc1123_time(file_ops::last_modified(resolved)));
+    resp.set_header("Last-Modified", utils::rfc1123_time(last_mod));
+    resp.set_header("ETag", etag);
+    resp.set_header("Cache-Control", "public, max-age=3600");
     resp.set_content_type(utils::mime_type(resolved.string()));
 
     if (range && fsize > 0) {
