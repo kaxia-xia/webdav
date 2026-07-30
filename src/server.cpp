@@ -229,6 +229,7 @@ void Server::worker_loop() {
                         conn->state = State::RECEIVING_BODY;
                         conn->output_fd = resp.body_output_fd;
                         conn->output_final_path = resp.body_output_path;
+                        conn->output_tmp_path = resp.body_tmp_path;
                         conn->body_expected = resp.body_expected;
                         conn->body_received = 0;
                         conn->existed_before_put = (resp.status_code == 200);
@@ -297,16 +298,18 @@ void Server::worker_loop() {
             // ══════════════════════════════════════════════════════════════
             case State::RECEIVING_BODY: {
                 if (res <= 0) {
-                    if (conn->output_fd >= 0) ::close(conn->output_fd);
-                    conn->output_fd = -1;
+                    if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                    // Upload failed — remove temp file
+                    if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
                     break;
                 }
 
                 ssize_t w = ::write(conn->output_fd, conn->read_buf, static_cast<size_t>(res));
                 if (w < 0) {
-                    if (conn->output_fd >= 0) ::close(conn->output_fd);
-                    conn->output_fd = -1;
+                    if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
+                    // Upload failed — remove temp file
+                    if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
                     close_connection(conn);
                     break;
                 }
@@ -314,6 +317,10 @@ void Server::worker_loop() {
 
                 if (conn->body_received >= conn->body_expected) {
                     ::close(conn->output_fd); conn->output_fd = -1;
+                    // Rename temp file to final destination
+                    if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
+                        ::rename(conn->output_tmp_path.c_str(), conn->output_final_path.c_str());
+                    }
                     conn->response_data = build_response_string(
                         conn->existed_before_put ? 200 : 201, conn->keep_alive);
                     conn->send_offset = 0;

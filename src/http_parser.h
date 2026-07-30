@@ -128,6 +128,7 @@ struct Response {
     int body_output_fd = -1;
     size_t body_expected = 0;
     std::string body_output_path;  // rename temp → this path on success
+    std::string body_tmp_path;     // temp file path to rename from
 
     void set_header(std::string_view name, std::string_view value);
     void set_content_type(std::string_view ct);

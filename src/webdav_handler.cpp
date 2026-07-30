@@ -547,6 +547,7 @@ http::Response WebDavHandler::handle_put(const http::Request& req, const fs::pat
     resp.body_output_fd = fd;
     resp.body_expected = body_size;
     resp.body_output_path = normalized.string();  // rename tmp → this on success
+    resp.body_tmp_path = tmp_path.string();       // temp file to rename from
     return resp;
 }
 

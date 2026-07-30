@@ -67,6 +67,7 @@ private:
         // File receiving (PUT streaming)
         int output_fd = -1;
         std::string output_final_path;
+        std::string output_tmp_path;
         size_t body_expected = 0;
         size_t body_received = 0;
         bool existed_before_put = false;
