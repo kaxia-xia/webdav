@@ -42,7 +42,9 @@ static void append_file_xml(std::string& out,
                             const file_ops::DirEntry& entry,
                             std::string& esc_buf)
 {
-    auto href_safe = escape_xml_fast(href, esc_buf);
+    // href must be percent-encoded per RFC 4918
+    std::string encoded_href = utils::url_encode(href);
+    auto href_safe = escape_xml_fast(encoded_href, esc_buf);
     auto name_safe = escape_xml_fast(entry.name, esc_buf);
 
     out += "    <D:response>\r\n";
@@ -54,6 +56,8 @@ static void append_file_xml(std::string& out,
 
     if (entry.is_directory) {
         out += "          <D:resourcetype><D:collection/></D:resourcetype>\r\n";
+        out += "          <D:getcontentlength>0</D:getcontentlength>\r\n";
+        out += "          <D:getcontenttype>httpd/unix-directory</D:getcontenttype>\r\n";
     } else {
         out += "          <D:resourcetype/>\r\n";
     }
@@ -82,18 +86,18 @@ static void append_file_xml(std::string& out,
         out += "          <D:getcontenttype>";
         out += mt_safe;
         out += "</D:getcontenttype>\r\n";
-
-        // ETag: same format as GET handler — "mtime_ns-fsize"
-        auto mt_dur = entry.last_modified.time_since_epoch();
-        auto mt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(mt_dur).count();
-        char etag_buf[64];
-        int n = snprintf(etag_buf, sizeof(etag_buf), "\"%ld-%ju\"",
-                         static_cast<long>(mt_ns),
-                         static_cast<uintmax_t>(entry.size));
-        out += "          <D:getetag>";
-        out.append(etag_buf, static_cast<size_t>(n));
-        out += "</D:getetag>\r\n";
     }
+
+    // ETag for both files and directories
+    auto mt_dur = entry.last_modified.time_since_epoch();
+    auto mt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(mt_dur).count();
+    char etag_buf[64];
+    int n = snprintf(etag_buf, sizeof(etag_buf), "\"%ld-%ju\"",
+                     static_cast<long>(mt_ns),
+                     static_cast<uintmax_t>(entry.size));
+    out += "          <D:getetag>";
+    out.append(etag_buf, static_cast<size_t>(n));
+    out += "</D:getetag>\r\n";
 
     out += "        </D:prop>\r\n";
     out += "        <D:status>HTTP/1.1 200 OK</D:status>\r\n";
