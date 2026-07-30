@@ -347,7 +347,18 @@ void Server::worker_loop() {
                         close_connection(conn);
                         break;
                     }
-                    // body_received was incremented before write submission
+                    // Handle short writes (disk full, quota, etc.)
+                    if (static_cast<size_t>(res) < conn->put_write_size) {
+                        size_t wrote = static_cast<size_t>(res);
+                        conn->body_received -= (conn->put_write_size - wrote);
+                        size_t remaining = conn->put_write_size - wrote;
+                        memmove(conn->read_buf, conn->read_buf + wrote, remaining);
+                        conn->put_write_size = remaining;
+                        conn->put_write_pending = true;
+                        if (!uring_write_body(conn)) close_connection(conn);
+                        break;
+                    }
+                    // Full write: check if done
                     if (conn->body_received >= conn->body_expected) {
                         ::close(conn->output_fd); conn->output_fd = -1;
                         if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {

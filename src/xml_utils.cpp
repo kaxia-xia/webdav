@@ -1,6 +1,7 @@
 #include "xml_utils.h"
 #include "utils.h"
 #include <cstdio>
+#include <chrono>
 
 namespace xml_utils {
 
@@ -82,11 +83,13 @@ static void append_file_xml(std::string& out,
         out += mt_safe;
         out += "</D:getcontenttype>\r\n";
 
-        // ETag: size-mtime
+        // ETag: same format as GET handler — "mtime_ns-fsize"
+        auto mt_dur = entry.last_modified.time_since_epoch();
+        auto mt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(mt_dur).count();
         char etag_buf[64];
-        int n = snprintf(etag_buf, sizeof(etag_buf), "\"%ju-%ld\"",
-                         static_cast<uintmax_t>(entry.size),
-                         static_cast<long>(entry.last_modified.time_since_epoch().count()));
+        int n = snprintf(etag_buf, sizeof(etag_buf), "\"%ld-%ju\"",
+                         static_cast<long>(mt_ns),
+                         static_cast<uintmax_t>(entry.size));
         out += "          <D:getetag>";
         out.append(etag_buf, static_cast<size_t>(n));
         out += "</D:getetag>\r\n";

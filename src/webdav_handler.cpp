@@ -424,12 +424,31 @@ http::Response WebDavHandler::handle_get(const http::Request& req, const fs::pat
             origin = "http://" + std::string(*host_hdr);
         }
 
+        // ETag from directory mtime (revalidate when contents change)
+        auto dir_mtime = file_ops::last_modified(resolved);
+        auto dir_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            dir_mtime.time_since_epoch()).count();
+        std::string etag = "\"" + std::to_string(dir_ns) + "-dir\"";
+
+        auto inm = req.header("If-None-Match");
+        if (inm && *inm == etag) {
+            http::Response resp;
+            resp.status_code = 304;
+            add_common_headers(resp);
+            resp.set_header("ETag", etag);
+            resp.set_header("Cache-Control", "public, max-age=60");
+            resp.set_content_length(0);
+            return resp;
+        }
+
         std::string html = html_dir::generate(path, resolved, origin);
 
         http::Response resp;
         resp.status_code = 200;
         add_common_headers(resp);
         add_security_headers(resp);
+        resp.set_header("ETag", etag);
+        resp.set_header("Cache-Control", "public, max-age=60");
         resp.set_content_type("text/html; charset=utf-8");
         resp.set_content_length(html.size());
         resp.body = std::move(html);
