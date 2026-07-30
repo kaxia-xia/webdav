@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <array>
+#include <sys/utsname.h>
 
 namespace utils {
 
@@ -258,6 +259,14 @@ bool iequals(std::string_view a, std::string_view b) {
 
 std::string rfc1123_now() {
     return rfc1123_time(std::chrono::system_clock::now());
+}
+
+std::string kernel_version() {
+    struct utsname buf;
+    if (uname(&buf) == 0) {
+        return std::string(buf.release);
+    }
+    return "unknown";
 }
 
 std::string format_size(uintmax_t size) {

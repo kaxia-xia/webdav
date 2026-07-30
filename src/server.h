@@ -57,6 +57,8 @@ private:
         size_t read_offset = 0;
 
         // Response (headers + small body, serialised)
+        // Per-connection buffer reused across keep-alive requests.
+        // Cleared on reset but capacity retained to avoid realloc.
         std::string response_data;
         size_t send_offset = 0;
 

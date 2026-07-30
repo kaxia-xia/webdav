@@ -70,10 +70,28 @@ target_compile_features(webdav-server PUBLIC cxx_std_20)
 target_link_libraries(webdav-server PRIVATE webdav-core)
 target_sources(webdav-server PRIVATE src/main.cpp)
 
-# ── Compiler warnings ────────────────────────────────────────────────────────
+# ── Compiler flags for Cortex-A55 (ARM Cortex-A55 / RK3566) ──────────────
+# -mcpu=cortex-a55 : tune for Cortex-A55 pipeline, enable ARMv8.2-A + crypto
+# -flto=auto       : link-time optimisation (cross-TU inlining)
+# -fno-semantic-interposition : assume no symbol interposition (better inlining)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(webdav-core   PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(webdav-server PRIVATE -Wall -Wextra -Wpedantic)
+    # Use LTO-aware archiver for static library
+    set(CMAKE_AR  /usr/bin/gcc-ar)
+    set(CMAKE_RANLIB /usr/bin/gcc-ranlib)
+    set(CMAKE_C_ARCHIVE_CREATE   "<CMAKE_AR> qcs <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> qcs <TARGET> <LINK_FLAGS> <OBJECTS>")
+
+    target_compile_options(webdav-core   PRIVATE
+        -Wall -Wextra -Wpedantic
+        -mcpu=cortex-a55
+        -flto=auto
+    )
+    target_compile_options(webdav-server PRIVATE
+        -Wall -Wextra -Wpedantic
+        -mcpu=cortex-a55
+        -flto=auto
+    )
+    target_link_options(webdav-server PRIVATE -flto=auto)
 endif()
 
 # ── Default install prefix ───────────────────────────────────────────────────

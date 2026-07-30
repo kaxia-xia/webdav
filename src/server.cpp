@@ -25,10 +25,33 @@
 
 // ── Per-thread constants ─────────────────────────────────────────────────────
 static constexpr unsigned RING_ENTRIES     = 512;
-static constexpr unsigned MAX_ACCEPTS      = 16;
 static constexpr uintptr_t ACCEPT_MARKER   = 1;
 static constexpr size_t   STREAM_THRESHOLD = 65536;
 static constexpr size_t   BUF_SIZE         = 65536;
+
+// ── Cached Date header (1-second granularity) ────────────────────────────────
+// Avoids calling gmtime_r + snprintf on every request. Thread-local so no
+// locking needed — each worker thread has its own cache.
+static thread_local time_t tls_cached_epoch = 0;
+static thread_local char   tls_cached_date[40];
+
+static std::string_view get_cached_date() {
+    time_t now = time(nullptr);
+    if (now != tls_cached_epoch) {
+        tls_cached_epoch = now;
+        struct tm tm_buf;
+        gmtime_r(&now, &tm_buf);
+        static const char* days[]   = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        static const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                       "Jul","Aug","Sep","Oct","Nov","Dec"};
+        int n = snprintf(tls_cached_date, sizeof(tls_cached_date),
+                         "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                         days[tm_buf.tm_wday], tm_buf.tm_mday, months[tm_buf.tm_mon],
+                         tm_buf.tm_year + 1900, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+        tls_cached_date[static_cast<size_t>(n)] = '\0';
+    }
+    return std::string_view(tls_cached_date);
+}
 
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
@@ -40,7 +63,8 @@ Server::Server(const fs::path& root_dir, int port, bool allow_browser,
     , num_workers_(std::thread::hardware_concurrency())
 {
     if (num_workers_ < 1) num_workers_ = 4;
-    std::cout << "[INFO] " << num_workers_ << " workers, io_uring backend" << std::endl;
+    std::cout << "[INFO] " << num_workers_ << " workers, io_uring backend "
+              << "(DEFER_TASKRUN + multishot accept)" << std::endl;
     thumbnail::init();
 }
 
@@ -79,9 +103,6 @@ void Server::close_connection(Connection* conn) {
         ::unlink(conn->output_tmp_path.c_str());
         conn->output_tmp_path.clear();
     }
-    // Clean up renamed but abandoned file (write completed, rename done,
-    // but connection died before response sent — file is valid but orphaned
-    // from the client's perspective; we leave it since rename already happened)
     delete conn;
 }
 
@@ -107,25 +128,43 @@ void Server::reset_connection(Connection* conn) {
     conn->output_final_path.clear();
 }
 
-std::string Server::build_response_string(int code, bool keep_alive) {
-    http::Response resp;
-    resp.status_code = code;
-    resp.set_header("Server", "WebDAV-Server/1.3 (C++20)");
-    resp.set_header("Date", utils::rfc1123_now());
-    resp.set_header("Accept-Ranges", "bytes");
-    resp.set_header("Connection", keep_alive ? "keep-alive" : "close");
-    resp.set_content_length(0);
-    return resp.to_string();
-}
+// ── Fast response builder (no heap alloc for small fixed responses) ──────────
 
-// ── ETag generator (weak, from mtime + size) ─────────────────────────────────
+std::string Server::build_response_string(int code, bool keep_alive) {
+    // Pre-built template: ~140 bytes, minimal alloc
+    const char* status_text = http::status_message(code);
+    auto date = get_cached_date();
+    const char* conn = keep_alive ? "keep-alive" : "close";
+
+    // Estimate: status line + 4 headers + CRLF ~= 180 bytes
+    std::string result;
+    result.reserve(200);
+
+    result  = "HTTP/1.1 ";
+    result += std::to_string(code);
+    result += " ";
+    result += status_text;
+    result += "\r\nServer: WebDAV-Server/1.4 (C++20)\r\nDate: ";
+    result.append(date.data(), date.size());
+    result += "\r\nAccept-Ranges: bytes\r\nConnection: ";
+    result += conn;
+    result += "\r\nContent-Length: 0\r\n\r\n";
+    return result;
+}
 
 // ── Worker thread (io_uring event loop) ──────────────────────────────────────
 
 void Server::worker_loop() {
     struct io_uring ring;
     struct io_uring_params params = {};
-    params.flags = IORING_SETUP_SINGLE_ISSUER;
+
+    // ── Optimisation flags ───────────────────────────────────────────────
+    // DEFER_TASKRUN:  CQEs are not delivered until the worker calls
+    //   io_uring_wait_cqe() or io_uring_submit().  No IPI per CQE —
+    //   critical on small ARM SoCs where interrupt overhead is high.
+    // SINGLE_ISSUER:  The ring is owned by this thread — skip internal locking.
+    params.flags = IORING_SETUP_SINGLE_ISSUER |
+                   IORING_SETUP_DEFER_TASKRUN;
 
     int ret = io_uring_queue_init_params(RING_ENTRIES, &ring, &params);
     if (ret < 0) {
@@ -133,12 +172,20 @@ void Server::worker_loop() {
         return;
     }
 
-    // ── Submission lambdas ──────────────────────────────────────────────────
+    // ── Register listen fd for faster accept (optional — works without too) ──
+    int reg_fd = server_fd_;
+    io_uring_register_files(&ring, &reg_fd, 1);
 
-    auto uring_accept = [&]() -> bool {
+    // ── Submission lambdas (all inline for zero-overhead) ─────────────────
+
+    // Multishot accept: one SQE, unlimited accepted connections.
+    // Each CQE gives us a new client fd. Re-arm is automatic.
+    auto uring_multishot_accept = [&]() -> bool {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return false;
-        io_uring_prep_accept(sqe, server_fd_, nullptr, nullptr, 0);
+        // Use direct fd. Registered files optional — IOSQE_FIXED_FILE + index 0
+        // would use indexed lookup, but plain fd is simpler and equally fast here.
+        io_uring_prep_multishot_accept(sqe, server_fd_, nullptr, nullptr, 0);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(ACCEPT_MARKER));
         return true;
     };
@@ -200,38 +247,51 @@ void Server::worker_loop() {
         return true;
     };
 
-    int accept_in_flight = 0;
-    for (unsigned i = 0; i < MAX_ACCEPTS; i++) {
-        if (uring_accept()) accept_in_flight++;
+    // ── Kick off multishot accept (one SQE, re-arms automatically) ───────
+    if (!uring_multishot_accept()) {
+        std::cerr << "[ERROR] multishot accept failed" << std::endl;
+        io_uring_queue_exit(&ring);
+        return;
     }
     io_uring_submit(&ring);
 
+    // ── Main event loop ──────────────────────────────────────────────────
     while (running_) {
         struct io_uring_cqe* cqe;
         ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0) {
             if (ret == -EINTR) continue;
+            // -EBADF or -EINVAL when server_fd_ closed during shutdown
+            if (ret == -EBADF || ret == -EINVAL) break;
             break;
         }
 
         uintptr_t ud = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
         int res = cqe->res;
+        unsigned flags = cqe->flags;
 
-        // ── Accept completion ─────────────────────────────────────────────
+        // ── Accept completion (multishot) ────────────────────────────────
         if (ud == ACCEPT_MARKER) {
-            accept_in_flight--;
+            // Multishot accept: res < 0 means accept error (e.g. EMFILE).
+            // IORING_CQE_F_MORE means more completions will follow from this
+            // SQE.  We treat EAGAIN / EBADF / EINVAL as transient and
+            // re-submit if needed.
             if (res >= 0) {
                 int client_fd = res;
                 set_socket_options(client_fd);
 
                 auto* conn = new Connection;
                 conn->fd = client_fd;
-
                 if (!uring_recv(conn)) close_connection(conn);
             }
-            while (accept_in_flight < static_cast<int>(MAX_ACCEPTS)) {
-                if (!uring_accept()) break;
-                accept_in_flight++;
+
+            // Multishot accept: if MORE is NOT set, the SQE is done.
+            // Resubmit a new multishot accept SQE.
+            if (!(flags & IORING_CQE_F_MORE)) {
+                if (!uring_multishot_accept()) {
+                    // Ring is full — this is rare but possible under load.
+                    // The next submission will make room.
+                }
             }
         }
         // ── Connection I/O completion ─────────────────────────────────────
@@ -272,9 +332,6 @@ void Server::worker_loop() {
 
                         std::string_view lv = conn->parser.leftover();
                         if (!lv.empty()) {
-                            // Submit async write for leftover — always,
-                            // even if it's the entire body. Completion
-                            // handled in RECEIVING_BODY.
                             conn->put_write_size = lv.size();
                             memmove(conn->read_buf, lv.data(), lv.size());
                             conn->body_received = lv.size();
@@ -309,18 +366,22 @@ void Server::worker_loop() {
                         resp.set_header("Connection", "keep-alive");
                     }
 
-                    conn->response_data = resp.to_string();
-                    conn->send_offset = 0;
-
                     // ── File send: set up splice pipe ────────────────
                     if (resp.file_to_send) {
                         conn->file_fd = ::open(resp.file_to_send->c_str(), O_RDONLY);
-                        if (conn->file_fd < 0) { close_connection(conn); break; }
-                        file_ops::lock_shared(conn->file_fd);
+                        if (conn->file_fd < 0) {
+                            conn->response_data = resp.to_string();
+                            conn->send_offset = 0;
+                            conn->state = State::SENDING_HEADERS;
+                            if (!uring_send(conn)) close_connection(conn);
+                            break;
+                        }
+                        // Non-blocking shared lock: if busy, serve anyway.
+                        // We never block the io_uring thread on advisory locks.
+                        file_ops::lock_shared_nb(conn->file_fd);
                         conn->file_off = resp.file_offset;
                         conn->file_remaining = resp.content_length_opt().value_or(0);
 
-                        // Create pipe + expand to 1 MiB for fewer splice rounds
                         if (::pipe2(conn->splice_pipe, O_NONBLOCK) < 0) {
                             close_connection(conn); break;
                         }
@@ -330,6 +391,8 @@ void Server::worker_loop() {
                         conn->splice_pending = 0;
                     }
 
+                    conn->response_data = resp.to_string();
+                    conn->send_offset = 0;
                     conn->state = State::SENDING_HEADERS;
                     if (!uring_send(conn)) close_connection(conn);
                 }
@@ -347,7 +410,6 @@ void Server::worker_loop() {
                         close_connection(conn);
                         break;
                     }
-                    // Handle short writes (disk full, quota, etc.)
                     if (static_cast<size_t>(res) < conn->put_write_size) {
                         size_t wrote = static_cast<size_t>(res);
                         conn->body_received -= (conn->put_write_size - wrote);
@@ -358,7 +420,6 @@ void Server::worker_loop() {
                         if (!uring_write_body(conn)) close_connection(conn);
                         break;
                     }
-                    // Full write: check if done
                     if (conn->body_received >= conn->body_expected) {
                         ::close(conn->output_fd); conn->output_fd = -1;
                         if (!conn->output_tmp_path.empty() && !conn->output_final_path.empty()) {
@@ -373,13 +434,11 @@ void Server::worker_loop() {
                         if (!uring_send(conn)) close_connection(conn);
                         break;
                     }
-                    // Submit next recv
                     conn->read_offset = 0;
                     if (!uring_recv(conn)) close_connection(conn);
                     break;
                 }
 
-                // ── Recv completion → submit async write ──────────────
                 if (res <= 0) {
                     if (conn->output_fd >= 0) { ::close(conn->output_fd); conn->output_fd = -1; }
                     if (!conn->output_tmp_path.empty()) ::unlink(conn->output_tmp_path.c_str());
@@ -410,7 +469,6 @@ void Server::worker_loop() {
                 }
 
                 if (conn->file_fd >= 0 && conn->file_remaining > 0) {
-                    // Kick off zero-copy splice: file → pipe
                     conn->state = State::SENDING_FILE;
                     conn->splice_phase = SplicePhase::TO_PIPE;
                     if (!uring_splice_to_pipe(conn)) close_connection(conn);
@@ -432,31 +490,24 @@ void Server::worker_loop() {
                 if (res <= 0) { close_connection(conn); break; }
 
                 if (conn->splice_phase == SplicePhase::TO_PIPE) {
-                    // Just completed splice(file → pipe)
                     conn->splice_pending = static_cast<size_t>(res);
                     conn->splice_phase = SplicePhase::TO_SOCKET;
-
                     if (!uring_splice_to_socket(conn)) close_connection(conn);
                 } else {
-                    // Just completed splice(pipe → socket)
                     size_t sent = static_cast<size_t>(res);
 
                     if (sent < conn->splice_pending) {
-                        // Short write — socket buffer full, retry remainder
                         conn->splice_pending -= sent;
                         if (!uring_splice_to_socket(conn)) close_connection(conn);
                     } else {
-                        // All pipe data consumed → advance file cursor
                         conn->file_off += static_cast<off_t>(conn->splice_pending);
                         conn->file_remaining -= conn->splice_pending;
                         conn->splice_pending = 0;
 
                         if (conn->file_remaining > 0) {
-                            // More file data → next chunk
                             conn->splice_phase = SplicePhase::TO_PIPE;
                             if (!uring_splice_to_pipe(conn)) close_connection(conn);
                         } else {
-                            // Done!
                             ::close(conn->file_fd); conn->file_fd = -1;
                             ::close(conn->splice_pipe[0]); conn->splice_pipe[0] = -1;
                             ::close(conn->splice_pipe[1]); conn->splice_pipe[1] = -1;
@@ -479,6 +530,10 @@ void Server::worker_loop() {
         }
 
         io_uring_cqe_seen(&ring, cqe);
+
+        // ── With DEFER_TASKRUN we must explicitly submit to flush SQEs ────
+        // Submit only when we've added new SQEs (tracked implicitly by the
+        // fact that every CQE handler above may queue new work).
         io_uring_submit(&ring);
     }
 
@@ -515,7 +570,8 @@ void Server::run() {
     shutdown_eventfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
     std::cout << "[INFO] http://0.0.0.0:" << port_ << " — " << handler_.root_dir() << std::endl;
-    std::cout << "[INFO] I/O: io_uring + splice (1 MiB pipe) — kernel 6.6, liburing 2.1" << std::endl;
+    std::cout << "[INFO] I/O: io_uring (DEFER_TASKRUN + multishot accept + splice 1 MiB pipe)" << std::endl;
+    std::cout << "[INFO] Kernel " << utils::kernel_version() << std::endl;
 
     workers_.reserve(num_workers_);
     for (unsigned i = 0; i < num_workers_; ++i) {

@@ -76,4 +76,8 @@ int try_lock_exclusive(const fs::path& p);
 // Used during sendfile to prevent concurrent modification/deletion.
 bool lock_shared(int fd);
 
+// Non-blocking shared lock — never blocks the calling thread.
+// Returns true on success, false if lock unavailable (caller proceeds anyway).
+bool lock_shared_nb(int fd);
+
 } // namespace file_ops

@@ -43,4 +43,7 @@ std::string rfc1123_now();
 // Human-readable file size (e.g. "1.5 MB")
 std::string format_size(uintmax_t size);
 
+// Kernel version string (e.g. "6.6.0-rc5")
+std::string kernel_version();
+
 } // namespace utils

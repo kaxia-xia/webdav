@@ -178,4 +178,8 @@ bool lock_shared(int fd) {
     return ::flock(fd, LOCK_SH) == 0;
 }
 
+bool lock_shared_nb(int fd) {
+    return ::flock(fd, LOCK_SH | LOCK_NB) == 0;
+}
+
 } // namespace file_ops
