@@ -35,6 +35,7 @@ private:
     enum class State {
         READING_REQUEST,
         RECEIVING_BODY,    // streaming PUT body to disk (async io_uring write)
+        OPENING_FILE,      // async openat for GET file serving
         SENDING_HEADERS,
         SENDING_FILE,      // zero-copy file send via splice(2)
         CLOSING,
@@ -64,6 +65,7 @@ private:
 
         // ── File serving (GET) — zero-copy via splice(2) ───────────────
         int file_fd = -1;
+        std::string file_path;   // for async openat
         off_t file_off = 0;
         size_t file_remaining = 0;
         int splice_pipe[2] = {-1, -1};
@@ -81,7 +83,7 @@ private:
         size_t put_write_size = 0;
     };
 
-    void worker_loop();
+    void worker_loop(unsigned worker_id);
     static void set_socket_options(int fd);
     static void close_connection(Connection* conn);
     static void reset_connection(Connection* conn);
